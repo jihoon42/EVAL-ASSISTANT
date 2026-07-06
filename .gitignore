@@ -1,0 +1,22 @@
+# 문서·데이터 산출물 — 저장소에는 코드와 설정만 유지
+*.pdf
+*.xlsx
+*.xls
+*.csv
+*.jsonl
+*.txt
+!requirements.txt
+
+# 로컬 데이터
+data/
+*.db
+
+# OS / 에디터 부산물
+*Zone.Identifier
+.~lock.*#
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+Thumbs.db

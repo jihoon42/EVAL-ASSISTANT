@@ -1,0 +1,12 @@
+# Streamlit 프로젝트 설정 — 팀원이 클론하면 자동 적용됨
+
+[browser]
+# 사용 통계(미국 서버 전송) 비활성화 + 첫 실행 시 이메일 입력 프롬프트 생략
+gatherUsageStats = false
+
+[server]
+# 기본값은 0.0.0.0(사내망 전체에서 접근 가능)이라 localhost로 제한한다.
+# WSL에서 돌려도 Windows 브라우저에서 localhost:8501 접속은 그대로 된다.
+address = "localhost"
+# WSL에는 브라우저가 없어 자동 실행이 실패(gio 에러)하므로 끔
+headless = true

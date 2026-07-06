@@ -1,0 +1,180 @@
+# =============================================================
+# taxonomy.yaml — 도메인 / 인텐트 / 슬롯 / 스타일 축 정의
+# 코드를 건드리지 않고 이 파일만 수정해서 도메인·인텐트를 확장할 수 있다.
+#
+# slots  : 해당 인텐트가 요구하는 시드 풀 이름 (seeds.yaml의 최상위 키)
+# templates : 템플릿 모드(LLM 미사용)에서 쓰는 문장 틀. {슬롯명}으로 치환.
+#             LLM 모드에서도 few-shot 힌트로 일부 활용된다.
+# =============================================================
+
+styles:
+  formality:            # 말투
+    - 반말
+    - 존댓말
+  completeness:         # 문장 완결성
+    - 완전한 문장
+    - 조사를 생략한 짧은 검색어풍
+
+domains:
+  weather:
+    name: 날씨
+    intents:
+      - id: precip
+        name: 강수
+        slots: [region, date_ref]
+        templates:
+          - "{region} {date_ref} 비 소식 있어?"
+          - "{region} {date_ref} 비 와?"
+          - "{date_ref} {region}에 비 올 확률 어느 정도야?"
+          - "{region} {date_ref} 우산 챙겨야 할까요?"
+      - id: snow
+        name: 눈
+        slots: [region, date_ref]
+        templates:
+          - "{region} {date_ref} 눈 온대?"
+          - "{date_ref} {region} 눈 소식 있나요?"
+      - id: temp
+        name: 기온
+        slots: [region, date_ref]
+        templates:
+          - "{region} {date_ref} 기온 어때?"
+          - "{date_ref} {region} 최고기온 몇 도야?"
+          - "{region} {date_ref} 아침에 많이 추워요?"
+      - id: feels_like
+        name: 체감온도
+        slots: [region, date_ref]
+        templates:
+          - "{region} {date_ref} 체감온도 어때?"
+          - "{date_ref} {region} 체감상 많이 더울까?"
+      - id: dust
+        name: 미세먼지
+        slots: [region, date_ref]
+        templates:
+          - "{region} {date_ref} 미세먼지 나빠?"
+          - "{date_ref} {region} 공기질 어때요?"
+          - "{region} 미세먼지 {date_ref} 마스크 써야 돼?"
+      - id: uv
+        name: 자외선
+        slots: [region, date_ref]
+        templates:
+          - "{region} {date_ref} 자외선 지수 높아?"
+          - "{date_ref} {region} 선크림 꼭 발라야 하나요?"
+      - id: wind
+        name: 바람
+        slots: [region, date_ref]
+        templates:
+          - "{region} {date_ref} 바람 많이 불어?"
+          - "{date_ref} {region} 강풍 예보 있나요?"
+      - id: typhoon
+        name: 태풍
+        slots: [region]
+        templates:
+          - "태풍 지금 {region} 쪽으로 와?"
+          - "{region} 태풍 영향권이야?"
+      - id: weekly
+        name: 주간예보
+        slots: [region]
+        templates:
+          - "{region} 이번 주 날씨 어때?"
+          - "{region} 주간 날씨 알려줘"
+          - "{region} 주말 날씨 괜찮을까요?"
+
+  local:
+    name: 로컬
+    intents:
+      - id: food_reco
+        name: 맛집 추천
+        slots: [anchor, food_category, local_constraint]
+        templates:
+          - "{anchor} 근처 {food_category} 추천, {local_constraint} 곳 있을까?"
+          - "{anchor} 주변에 {local_constraint} {food_category} 있어?"
+          - "{anchor} 근처에서 {food_category} 갈 만한 데 알려줘. {local_constraint} 곳으로."
+      - id: place_reco
+        name: 시설 추천
+        slots: [anchor, place_category]
+        templates:
+          - "{anchor} 근처 {place_category} 추천해줘"
+          - "{anchor} 주변에 {place_category} 어디가 괜찮아?"
+          - "{anchor}에서 가까운 {place_category} 알려주세요"
+      - id: nearest
+        name: 최단거리 탐색
+        slots: [anchor, place_category]
+        templates:
+          - "{anchor}에서 출발했을 때 가장 가까운 {place_category} 추천해줘"
+          - "{anchor} 기준으로 제일 가까운 {place_category} 어디야?"
+      - id: open_now
+        name: 영업시간 확인
+        slots: [anchor, food_category]
+        templates:
+          - "{anchor} 근처 {food_category} 중에 지금 영업하는 데 있어?"
+          - "{anchor} 주변 {food_category} 몇 시까지 해?"
+      - id: parking
+        name: 주차 문의
+        slots: [anchor]
+        templates:
+          - "{anchor} 근처에 주차할 데 있어?"
+          - "{anchor} 주변 공영주차장 어디 있나요?"
+      - id: route_time
+        name: 이동시간 문의
+        slots: [anchor, region]
+        templates:
+          - "{anchor}에서 {region}까지 차로 얼마나 걸려?"
+          - "{anchor}에서 {region} 가는 제일 빠른 방법 알려줘"
+
+  finance:
+    name: 금융
+    intents:
+      - id: stock_price
+        name: 시세 조회
+        slots: [stock, date_ref]
+        templates:
+          - "{stock} {date_ref} 주가 얼마야?"
+          - "{stock} {date_ref} 얼마에 거래되고 있어?"
+          - "{stock} {date_ref} 주가 어떻게 됐어요?"
+      - id: stock_move
+        name: 등락 문의
+        slots: [stock, date_ref]
+        templates:
+          - "{stock} {date_ref} 왜 올랐어?"
+          - "{stock} {date_ref} 많이 빠졌어?"
+      - id: term_explain
+        name: 용어 설명
+        slots: [fin_term]
+        templates:
+          - "{fin_term}이 뭐야?"
+          - "{fin_term} 쉽게 설명해줘"
+          - "{fin_term}은 무슨 뜻인가요?"
+      - id: condition
+        name: 조건·자격 문의
+        slots: [fin_condition_term]
+        templates:
+          - "{fin_condition_term} 조건이 어떻게 돼?"
+          - "{fin_condition_term} 받으려면 뭐가 필요해요?"
+          - "{fin_condition_term} 자격 되는지 어떻게 확인해?"
+      - id: payment_due
+        name: 납부 시기·기한
+        slots: [fin_pay_term]
+        templates:
+          - "{fin_pay_term}은 언제까지 내야 해?"
+          - "{fin_pay_term} 납부 기한이 언제야?"
+          - "{fin_pay_term}는 언제 내는 건가요?"
+      - id: procedure
+        name: 절차 문의
+        slots: [fin_product]
+        templates:
+          - "{fin_product} 신청 어떻게 해?"
+          - "{fin_product} 가입 절차 알려줘"
+          - "{fin_product}은 어디서 신청하나요?"
+      - id: compare
+        name: 상품 비교
+        slots: [fin_product, fin_product2]
+        templates:
+          - "{fin_product}랑 {fin_product2} 중에 뭐가 나아?"
+          - "{fin_product} {fin_product2} 차이가 뭐야?"
+      - id: tax_calc
+        name: 세금·이자 계산
+        slots: [fin_calc_term]
+        templates:
+          - "{fin_calc_term} 계산 어떻게 해?"
+          - "{fin_calc_term}은 얼마나 나와요?"
+          - "{fin_calc_term} 대략 얼마 나올지 알려줘"
