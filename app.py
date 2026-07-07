@@ -457,6 +457,22 @@ with tab_result:
 
         st.markdown("**검수 결과 (제출양식 뷰)** — 셀을 드래그로 선택해 복사(Ctrl+C)한 뒤 "
                     "카카오 시트에 그대로 붙여넣으세요.")
+        f1, f2 = st.columns([1, 3])
+        with f1:
+            scope = st.selectbox(
+                "표시 범위", ["전체", "오늘 검수분", "날짜 지정"], key="submit_scope",
+                help="매일 공유 시트에 그날 검수분만 붙여넣을 때 쓰세요. "
+                     "아래 표와 xlsx '제출양식' 시트에 적용됩니다 (요약·내부분석 시트는 항상 전체).")
+        if scope == "오늘 검수분":
+            view_results = results[results["검수일시"].str[:10] == date.today().isoformat()]
+        elif scope == "날짜 지정":
+            with f2:
+                scope_date = st.date_input("날짜", value=date.today(), key="submit_scope_date")
+            view_results = results[results["검수일시"].str[:10] == scope_date.isoformat()]
+        else:
+            view_results = results
+        if scope != "전체":
+            st.caption(f"선택 범위 검수 {len(view_results)}건 (전체 {len(results)}건)")
         with st.expander("컬럼 구성 수정 — 카카오 양식에 열이 추가·삭제되면 여기서 맞추기"):
             st.caption(
                 "한 줄이 컬럼 하나이고 순서 그대로 아래 표와 xlsx에 반영됩니다. "
@@ -474,10 +490,10 @@ with tab_result:
 
         def submit_series(name: str) -> pd.Series:
             if name in SUBMIT_DERIVED:
-                return SUBMIT_DERIVED[name](results)
-            if name in results.columns:
-                return results[name]
-            return pd.Series("", index=results.index)  # 카카오 측 기입란 → 제목만 있는 빈 컬럼
+                return SUBMIT_DERIVED[name](view_results)
+            if name in view_results.columns:
+                return view_results[name]
+            return pd.Series("", index=view_results.index)  # 카카오 측 기입란 → 빈 컬럼
 
         def unique_columns(names: list[str]) -> list[str]:
             """화면 표시용 중복 해소 — 같은 이름 뒤에 보이지 않는 공백을 붙인다."""
