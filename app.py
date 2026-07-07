@@ -89,13 +89,27 @@ with st.sidebar:
     st.caption(f"Ollama: {'🟢 연결됨' if ollama_ok else '⚪ 미연결 (템플릿 모드 사용 가능)'}")
     st.caption("데이터는 이 PC의 data/ 폴더에만 저장됩니다.")
 
-tab_gen, tab_review, tab_result, tab_trend = st.tabs(
-    ["① 질문 생성", "② 검수 진행", "③ 결과·내보내기", "④ 트렌드 시드"])
+# st.tabs는 위젯 변경 rerun 시 활성 탭이 첫 탭으로 튕기는 문제가 있어(예: ② 탭에서
+# 검수할 질문을 고르면 ① 화면으로 이동) 세션 상태에 고정되는 페이지 방식을 쓴다.
+PAGES = ["① 질문 생성", "② 검수 진행", "③ 결과·내보내기", "④ 트렌드 시드"]
+_pick = st.segmented_control("페이지 이동", PAGES, key="nav", default=PAGES[0],
+                             label_visibility="collapsed")
+page = _pick or st.session_state.get("nav_last", PAGES[0])  # 재클릭 해제 시 현재 페이지 유지
+st.session_state["nav_last"] = page
+
+# 페이지를 오가도 작성 중이던 입력이 날아가지 않도록 위젯 상태를 고정한다.
+# (렌더링되지 않은 위젯의 상태는 Streamlit이 정리해 버리므로 재대입으로 보존 표시)
+_PRESERVE_KEYS = ("rv_response", "rv_search", "rv_acc_comment", "rv_out_comment",
+                  "rv_fail", "rv_err", "mq_text", "mq_entities", "submit_layout",
+                  "trend_src", "trend_raw", "trend_val")
+for _k in _PRESERVE_KEYS:
+    if _k in st.session_state:
+        st.session_state[_k] = st.session_state[_k]
 
 # ---------------------------------------------------------------
 # ① 질문 생성
 # ---------------------------------------------------------------
-with tab_gen:
+if page == "① 질문 생성":
     st.subheader("평가 질문 생성")
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
@@ -212,7 +226,7 @@ with tab_gen:
 # ---------------------------------------------------------------
 # ② 검수 진행
 # ---------------------------------------------------------------
-with tab_review:
+if page == "② 검수 진행":
     with st.expander("💡 직접 떠올린 질문 추가 — 저장하면 바로 다음 검수 차례가 됩니다"):
         st.caption(
             "테스트 중 생각난 질문을 여기 먼저 등록하면: ① 과거에 이미 (비슷하게) 테스트한 질문이면 "
@@ -413,7 +427,7 @@ with tab_review:
 # ---------------------------------------------------------------
 # ③ 결과·내보내기
 # ---------------------------------------------------------------
-with tab_result:
+if page == "③ 결과·내보내기":
     results = db.results_df()
     if results.empty:
         st.info("아직 검수 완료된 항목이 없습니다.")
@@ -614,7 +628,7 @@ with tab_result:
 # ---------------------------------------------------------------
 # ④ 트렌드 시드 (최신 기사·리뷰 → 엔티티 추출 → 생성에 혼입)
 # ---------------------------------------------------------------
-with tab_trend:
+if page == "④ 트렌드 시드":
     st.subheader("트렌드 시드 — 최신 기사·리뷰에서 엔티티 수혈")
     st.caption(
         "기사·리뷰 본문을 붙여넣으면 로컬 LLM이 시드 후보를 추출합니다. 검토 후 등록하면 "
