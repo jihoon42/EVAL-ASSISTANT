@@ -365,14 +365,14 @@ if page == "② 검수 진행":
                 acc_verdict = st.radio("정확도 판정", VERDICTS, horizontal=True,
                                        label_visibility="collapsed", key="rv_acc")
                 fail_types = st.multiselect("N 사유 (fail 시 선택)", FAIL_TYPES, key="rv_fail")
-                acc_comment = st.text_input("정확도 코멘트", key="rv_acc_comment")
+                acc_comment = st.text_area("정확도 코멘트", key="rv_acc_comment", height=68)
 
                 st.markdown("**2) LLM 출력**")
                 out_verdict = st.radio("LLM 출력 판정", VERDICTS, horizontal=True,
                                        label_visibility="collapsed", key="rv_out")
                 output_errors = st.multiselect("오류 유형 (fail 시 선택)", OUTPUT_ERROR_TYPES,
                                                key="rv_err")
-                out_comment = st.text_input("출력 오류 코멘트", key="rv_out_comment")
+                out_comment = st.text_area("출력 오류 코멘트", key="rv_out_comment", height=68)
 
                 allow_dup = st.checkbox(
                     "이전 검수와 같은 search ID/앱 응답이어도 저장", key="rv_allow_dup",
@@ -556,8 +556,8 @@ if page == "③ 결과·내보내기":
                     fail_opts = FAIL_TYPES + [v for v in stored_fail if v not in FAIL_TYPES]
                     e_fail = st.multiselect("N 사유 (fail 시)", fail_opts, default=stored_fail,
                                             key=f"ed_fail_{target}")
-                    e_acc_c = st.text_input("정확도 코멘트", value=detail["reason"] or "",
-                                            key=f"ed_accc_{target}")
+                    e_acc_c = st.text_area("정확도 코멘트", value=detail["reason"] or "",
+                                           key=f"ed_accc_{target}", height=68)
                     e_out = st.radio(
                         "2) LLM 출력", VERDICTS, horizontal=True, key=f"ed_out_{target}",
                         index=VERDICTS.index(detail["output_verdict"]) if detail["output_verdict"] in VERDICTS else 0)
@@ -565,8 +565,8 @@ if page == "③ 결과·내보내기":
                     err_opts = OUTPUT_ERROR_TYPES + [v for v in stored_err if v not in OUTPUT_ERROR_TYPES]
                     e_err = st.multiselect("오류 유형 (fail 시)", err_opts, default=stored_err,
                                            key=f"ed_err_{target}")
-                    e_out_c = st.text_input("출력 오류 코멘트", value=detail["output_comment"] or "",
-                                            key=f"ed_outc_{target}")
+                    e_out_c = st.text_area("출력 오류 코멘트", value=detail["output_comment"] or "",
+                                           key=f"ed_outc_{target}", height=68)
                     e_allow_dup = st.checkbox("다른 검수와 같은 search ID/앱 응답이어도 저장",
                                               key=f"ed_dup_{target}")
                     save_edit = st.form_submit_button("수정 저장 (검수일시·테스터는 원본 유지)",
