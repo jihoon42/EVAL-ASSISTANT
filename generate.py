@@ -84,18 +84,35 @@ def sample_combo(domain_key: str, taxonomy: dict, pools: dict, rng: random.Rando
                  trend_pools: dict[str, list[str]] | None = None,
                  trend_ratio: float = 0.0) -> dict:
     """슬롯 조합 샘플링. trend_pools에 해당 슬롯 값이 있으면 trend_ratio 확률로
-    트렌드 시드에서 뽑고, 하나라도 쓰이면 seed_origin='trend'로 태깅한다."""
+    트렌드 시드에서 뽑고, 하나라도 쓰이면 seed_origin='trend'로 태깅한다.
+
+    기본 풀이 빈 슬롯(seeds.yaml의 트렌드 전용 풀, 예: typhoon_name)은 트렌드 시드가
+    있을 때만 그 인텐트가 후보에 들어가고, 값은 비율과 무관하게 트렌드에서 뽑는다.
+    """
     domain = taxonomy["domains"][domain_key]
-    intent = rng.choice(domain["intents"])
+    tp = trend_pools or {}
+
+    def intent_available(it: dict) -> bool:
+        for s in it["slots"]:
+            if s not in pools:
+                raise KeyError(f"seeds.yaml에 풀이 없음: {s}")
+            if not pools[s] and not tp.get(s):
+                return False  # 트렌드 전용 풀인데 시드가 없음(만료 등) → 인텐트 비활성
+        return True
+
+    available = [it for it in domain["intents"] if intent_available(it)]
+    if not available:
+        raise ValueError(f"도메인 {domain_key}에 값을 채울 수 있는 인텐트가 없음")
+    intent = rng.choice(available)
 
     slots: dict[str, str] = {}
     trend_used = False
     for slot in intent["slots"]:
-        if slot not in pools:
-            raise KeyError(f"seeds.yaml에 풀이 없음: {slot}")
-        trend_vals = (trend_pools or {}).get(slot) or []
-        pick_trend = bool(trend_vals) and rng.random() < trend_ratio
-        pool_vals = trend_vals if pick_trend else pools[slot]
+        trend_vals = tp.get(slot) or []
+        base_vals = pools[slot]
+        # 기본 풀이 비어 있으면(트렌드 전용) 무조건 트렌드에서
+        pick_trend = bool(trend_vals) and (not base_vals or rng.random() < trend_ratio)
+        pool_vals = trend_vals if pick_trend else base_vals
         value = rng.choice(pool_vals)
         # 'xxx2' 슬롯은 같은 계열 풀에서 중복 없이 뽑는다 (예: fin_product2)
         base = slot[:-1] if slot.endswith("2") else None

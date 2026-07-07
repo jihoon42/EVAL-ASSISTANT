@@ -39,14 +39,18 @@ DEFAULT_SUBMIT_LAYOUT = ["단계", "날짜", "테스터", "search ID", "검색 �
 SUBMIT_DERIVED = {
     "날짜": lambda df: pd.to_datetime(df["검수일시"]).dt.strftime("%Y. %m. %d"),
 }
-# 트렌드 시드를 배정할 수 있는 풀과, 추출기(LLM)에 주는 풀 설명
+# 트렌드 시드를 배정할 수 있는 풀과, 추출기(LLM)에 주는 풀 설명.
+# typhoon_name/ipo_stock/hot_item은 트렌드 전용 — 시드가 있어야 이벤트형 인텐트가 열린다.
 TREND_POOL_GUIDE = {
     "region": "날씨 질문에 쓸 국내 지역·도시 이름",
+    "typhoon_name": "본문에 등장하는 태풍 이름 (예: 바비, 힌남노)",
     "anchor": "로컬 질문의 기준점이 되는 역·동네·상권 이름",
-    "food_category": "음식점 종류 또는 유행하는 음식·디저트 품목",
+    "food_category": "음식점 종류 (예: 한식집, 브런치 카페)",
+    "hot_item": "지금 유행하는 음식·디저트·상품 품목 (예: 두쫀쿠)",
     "place_category": "생활 시설·업종 이름",
     "local_constraint": "가게 이용 조건 표현 (예: 24시간 하는)",
     "stock": "국내 상장 종목명",
+    "ipo_stock": "청약·상장을 앞둔 공모주 종목명",
     "fin_term": "금융 용어·제도 이름",
     "fin_condition_term": "조건·자격을 묻기 자연스러운 금융 상품·제도",
     "fin_pay_term": "납부 기한을 묻기 자연스러운 세금·수수료",

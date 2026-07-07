@@ -78,6 +78,20 @@ domains:
           - "{region} 이번 주 날씨 어때?"
           - "{region} 주간 날씨 알려줘"
           - "{region} 주말 날씨 괜찮을까요?"
+      # 이벤트형: typhoon_name 트렌드 시드가 있을 때만 활성화
+      - id: typhoon_track
+        name: 태풍 경로(이벤트)
+        slots: [typhoon_name]
+        templates:
+          - "태풍 {typhoon_name} 지금 어디쯤이야?"
+          - "{typhoon_name} 경로 알려줘"
+          - "{typhoon_name} 언제 우리나라 지나가?"
+      - id: typhoon_impact
+        name: 태풍 영향(이벤트)
+        slots: [typhoon_name, region]
+        templates:
+          - "태풍 {typhoon_name} 때문에 {region}도 영향 있어?"
+          - "{typhoon_name} 올라오면 {region} 비바람 심해져?"
 
   local:
     name: 로컬
@@ -120,6 +134,14 @@ domains:
         templates:
           - "{anchor}에서 {region}까지 차로 얼마나 걸려?"
           - "{anchor}에서 {region} 가는 제일 빠른 방법 알려줘"
+      # 이벤트형: hot_item 트렌드 시드가 있을 때만 활성화
+      - id: hot_item_where
+        name: 유행 아이템 구매처(이벤트)
+        slots: [anchor, hot_item]
+        templates:
+          - "{anchor} 근처에 {hot_item} 파는 데 있어?"
+          - "{hot_item} 사려면 {anchor} 쪽 어디로 가야 해?"
+          - "{anchor}에서 {hot_item} 파는 곳 알려줘"
 
   finance:
     name: 금융
@@ -178,3 +200,11 @@ domains:
           - "{fin_calc_term} 계산 어떻게 해?"
           - "{fin_calc_term}은 얼마나 나와요?"
           - "{fin_calc_term} 대략 얼마 나올지 알려줘"
+      # 이벤트형: ipo_stock 트렌드 시드가 있을 때만 활성화
+      - id: ipo_schedule
+        name: 공모주 청약(이벤트)
+        slots: [ipo_stock]
+        templates:
+          - "{ipo_stock} 청약 일정 알려줘"
+          - "{ipo_stock} 공모가 얼마로 정해졌어?"
+          - "{ipo_stock} 상장일이 언제야?"
