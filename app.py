@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from io import BytesIO
 
 import pandas as pd
+import requests
 import streamlit as st
 
 import db
@@ -37,6 +38,20 @@ DEFAULT_SUBMIT_LAYOUT = ["단계", "날짜", "테스터", "search ID", "검색 �
 # 검수 데이터에서 가공해 만드는 컬럼. 그 외 이름은 results_df 컬럼과 같으면 그대로 사용.
 SUBMIT_DERIVED = {
     "날짜": lambda df: pd.to_datetime(df["검수일시"]).dt.strftime("%Y. %m. %d"),
+}
+# 트렌드 시드를 배정할 수 있는 풀과, 추출기(LLM)에 주는 풀 설명
+TREND_POOL_GUIDE = {
+    "region": "날씨 질문에 쓸 국내 지역·도시 이름",
+    "anchor": "로컬 질문의 기준점이 되는 역·동네·상권 이름",
+    "food_category": "음식점 종류 또는 유행하는 음식·디저트 품목",
+    "place_category": "생활 시설·업종 이름",
+    "local_constraint": "가게 이용 조건 표현 (예: 24시간 하는)",
+    "stock": "국내 상장 종목명",
+    "fin_term": "금융 용어·제도 이름",
+    "fin_condition_term": "조건·자격을 묻기 자연스러운 금융 상품·제도",
+    "fin_pay_term": "납부 기한을 묻기 자연스러운 세금·수수료",
+    "fin_calc_term": "금액 계산을 묻기 자연스러운 항목",
+    "fin_product": "금융 상품 유형",
 }
 
 # ---------------------------------------------------------------
@@ -70,7 +85,8 @@ with st.sidebar:
     st.caption(f"Ollama: {'🟢 연결됨' if ollama_ok else '⚪ 미연결 (템플릿 모드 사용 가능)'}")
     st.caption("데이터는 이 PC의 data/ 폴더에만 저장됩니다.")
 
-tab_gen, tab_review, tab_result = st.tabs(["① 질문 생성", "② 검수 진행", "③ 결과·내보내기"])
+tab_gen, tab_review, tab_result, tab_trend = st.tabs(
+    ["① 질문 생성", "② 검수 진행", "③ 결과·내보내기", "④ 트렌드 시드"])
 
 # ---------------------------------------------------------------
 # ① 질문 생성
@@ -100,6 +116,14 @@ with tab_gen:
             disabled=(mode == "template"),
             help="LLM 호출 1회당 생성 질문 수. 고정 프롬프트 비용을 나눠 가져 CPU에서 클수록 빠릅니다.")
 
+    trend_pools = db.active_trend_seeds()
+    n_trend = sum(len(v) for v in trend_pools.values())
+    trend_ratio = st.slider(
+        "트렌드 시드 주입 비율", 0.0, 1.0, 0.3, 0.05, disabled=(n_trend == 0),
+        help="슬롯을 채울 때 이 확률로 트렌드 시드(④ 탭에서 등록)에서 값을 뽑습니다. "
+             f"현재 유효한 트렌드 시드 {n_trend}개"
+             + ("" if n_trend else " — ④ 탭에서 먼저 등록하세요."))
+
     if st.button("생성 시작", type="primary", disabled=not picked):
         progress = st.progress(0.0, text="생성 중...")
 
@@ -114,15 +138,19 @@ with tab_gen:
                 count=int(count), domains=picked, mode=mode, model=model,
                 batch=int(batch), exemplars=exemplars,
                 existing_questions=db.all_question_texts(),  # 과거 생성분과 준중복 방지
+                trend_pools=trend_pools, trend_ratio=float(trend_ratio),
                 on_progress=on_progress,
             )
             inserted = db.insert_questions(records)
             progress.progress(1.0, text="완료")
-            st.success(f"{inserted}건 생성·저장 완료 (모드: {records[0]['gen_mode'] if records else mode})")
+            n_trend_q = sum(1 for r in records if r.get("seed_origin") == "trend")
+            st.success(f"{inserted}건 생성·저장 완료 (모드: {records[0]['gen_mode'] if records else mode}"
+                       + (f", 트렌드 시드 질문 {n_trend_q}건" if n_trend_q else "") + ")")
             st.dataframe(
                 pd.DataFrame(
                     [{"도메인": r["domain_name"], "인텐트": r["intent_name"],
-                      "질문": r["question"], "생성모드": r["gen_mode"]} for r in records]
+                      "질문": r["question"], "생성모드": r["gen_mode"],
+                      "시드출처": r.get("seed_origin", "base")} for r in records]
                 ),
                 width="stretch", hide_index=True,
             )
@@ -352,6 +380,25 @@ with tab_result:
         pivot["pass율(%)"] = (pivot.get("pass", 0) / pivot["합계"] * 100).round(1)
         st.dataframe(pivot, width="stretch")
 
+        trend_mask = results["시드출처"] == "trend"
+        if trend_mask.any():
+            st.markdown("**트렌드 시드 질문 체크** — 최신 엔티티에 대한 응답 품질 "
+                        "(최신성 fail율이 기본 시드보다 높다면 카나나가 최신 정보를 못 따라오는 신호)")
+
+            def _rates(df: pd.DataFrame) -> pd.Series:
+                return pd.Series({
+                    "검수 건수": len(df),
+                    "정확도 pass율(%)": round((df["1) 정확도"] == "pass").mean() * 100, 1),
+                    "최신성 fail율(%)": round(
+                        df["N 사유"].fillna("").str.contains("최신성").mean() * 100, 1),
+                })
+
+            groups = [("트렌드 시드", results[trend_mask])]
+            if (~trend_mask).any():
+                groups.append(("기본 시드", results[~trend_mask]))
+            st.dataframe(pd.DataFrame({name: _rates(df) for name, df in groups}).T,
+                         width="stretch")
+
         st.markdown("**검수 결과 (제출양식 뷰)** — 셀을 드래그로 선택해 복사(Ctrl+C)한 뒤 "
                     "카카오 시트에 그대로 붙여넣으세요.")
         with st.expander("컬럼 구성 수정 — 카카오 양식에 열이 추가·삭제되면 여기서 맞추기"):
@@ -491,3 +538,102 @@ with tab_result:
         )
         st.caption("※ '내부분석' 시트에는 앱 응답 전문·도메인·인텐트가 포함됩니다. "
                    "카카오 제출 시 '제출양식' 시트만 복사해 쓰세요.")
+
+# ---------------------------------------------------------------
+# ④ 트렌드 시드 (최신 기사·리뷰 → 엔티티 추출 → 생성에 혼입)
+# ---------------------------------------------------------------
+with tab_trend:
+    st.subheader("트렌드 시드 — 최신 기사·리뷰에서 엔티티 수혈")
+    st.caption(
+        "기사·리뷰 본문을 붙여넣으면 로컬 LLM이 시드 후보를 추출합니다. 검토 후 등록하면 "
+        "① 탭 생성 시 설정한 비율로 섞여 들어가고, 그 질문은 시드출처=trend로 태깅되어 "
+        "③ 탭에서 최신성 fail율을 따로 볼 수 있습니다. **본문 원문은 저장하지 않고**, "
+        "만료된 시드는 생성에 쓰이지 않습니다."
+    )
+
+    trend_src = st.text_input("출처 메모 (기사 제목·URL 등)", key="trend_src")
+    trend_raw = st.text_area("기사/리뷰 본문 붙여넣기", height=180, key="trend_raw",
+                             placeholder="본문을 통째로 붙여넣어도 됩니다. 광고 문구는 추출·검토 단계에서 걸러집니다.")
+    tc1, tc2 = st.columns([1, 3])
+    with tc1:
+        trend_days = st.number_input("유효기간(일)", min_value=1, max_value=365, value=14,
+                                     help="만료되면 생성에 더 이상 쓰이지 않습니다 (기록은 남음).")
+    with tc2:
+        st.write("")
+        st.write("")
+        extract_clicked = st.button("후보 추출", type="primary",
+                                    disabled=not trend_raw.strip() or not ollama_ok)
+    if not ollama_ok:
+        st.info("Ollama 미연결 — 자동 추출은 불가하지만 아래 '직접 등록'은 사용할 수 있습니다.")
+
+    if extract_clicked:
+        with st.spinner("본문에서 후보 추출 중..."):
+            try:
+                cands = gen.extract_trend_candidates(trend_raw, TREND_POOL_GUIDE)
+                # 본문에 그대로 등장하는지 표시 (환각 방지 확인용)
+                st.session_state["trend_cands"] = [
+                    {**c, "verbatim": c["value"] in trend_raw} for c in cands]
+                if not cands:
+                    st.warning("후보를 찾지 못했습니다. 본문을 더 넣거나 직접 등록해 보세요.")
+            except requests.RequestException as e:
+                st.error(f"추출 실패: {e}")
+
+    cands = st.session_state.get("trend_cands")
+    if cands:
+        st.markdown("**추출 후보 검토** — 값·풀을 고치고, 등록할 항목만 체크하세요. "
+                    "'본문일치'가 꺼진 항목은 본문에 없는 표현이니 특히 확인하세요.")
+        cand_df = pd.DataFrame([
+            {"등록": c["verbatim"], "값": c["value"], "풀": c["pool"], "본문일치": c["verbatim"]}
+            for c in cands])
+        edited = st.data_editor(
+            cand_df, hide_index=True, width="stretch", key="trend_editor",
+            column_config={
+                "등록": st.column_config.CheckboxColumn("등록"),
+                "값": st.column_config.TextColumn("값"),
+                "풀": st.column_config.SelectboxColumn("풀", options=list(TREND_POOL_GUIDE)),
+                "본문일치": st.column_config.CheckboxColumn("본문일치", disabled=True),
+            })
+        if st.button("체크한 후보 등록"):
+            expires = (date.today() + timedelta(days=int(trend_days))).isoformat()
+            items = [{"value": str(r["값"]).strip(), "pool": r["풀"],
+                      "source": trend_src.strip(), "expires_at": expires}
+                     for _, r in edited.iterrows()
+                     if r["등록"] and str(r["값"]).strip() and r["풀"] in TREND_POOL_GUIDE]
+            n = db.add_trend_seeds(items)
+            st.session_state.pop("trend_cands", None)
+            st.toast(f"{n}건 등록" + (f" (중복 {len(items) - n}건 무시)" if len(items) != n else ""))
+            st.rerun()
+
+    st.divider()
+    st.markdown("**직접 등록** — 추출 없이 값을 바로 추가")
+    dc1, dc2, dc3 = st.columns([2, 3, 1])
+    with dc1:
+        t_val = st.text_input("값", key="trend_val", placeholder="두쫀쿠")
+    with dc2:
+        t_pool = st.selectbox("풀", list(TREND_POOL_GUIDE), key="trend_pool",
+                              format_func=lambda p: f"{p} — {TREND_POOL_GUIDE[p]}")
+    with dc3:
+        st.write("")
+        st.write("")
+        if st.button("등록", disabled=not t_val.strip()):
+            expires = (date.today() + timedelta(days=int(trend_days))).isoformat()
+            n = db.add_trend_seeds([{"value": t_val.strip(), "pool": t_pool,
+                                     "source": trend_src.strip(), "expires_at": expires}])
+            st.toast("등록했습니다." if n else "이미 등록된 값입니다.")
+            st.rerun()
+
+    st.divider()
+    st.markdown("**등록된 트렌드 시드**")
+    tdf = db.trend_seeds_df()
+    if tdf.empty:
+        st.caption("아직 등록된 트렌드 시드가 없습니다.")
+    else:
+        t_event = st.dataframe(tdf, hide_index=True, width="stretch",
+                               on_select="rerun", selection_mode="multi-row",
+                               column_config={"id": None}, key="trend_table")
+        t_rows = [i for i in t_event.selection.rows if i < len(tdf)]
+        t_ids = tdf.iloc[t_rows]["id"].tolist()
+        if st.button(f"선택 {len(t_ids)}건 삭제", disabled=not t_ids):
+            db.delete_trend_seeds(t_ids)
+            st.toast(f"{len(t_ids)}건 삭제")
+            st.rerun()

@@ -80,20 +80,30 @@ def load_taxonomy() -> dict:
 # 슬롯 조합 샘플링
 # ---------------------------------------------------------------
 
-def sample_combo(domain_key: str, taxonomy: dict, pools: dict, rng: random.Random) -> dict:
+def sample_combo(domain_key: str, taxonomy: dict, pools: dict, rng: random.Random,
+                 trend_pools: dict[str, list[str]] | None = None,
+                 trend_ratio: float = 0.0) -> dict:
+    """슬롯 조합 샘플링. trend_pools에 해당 슬롯 값이 있으면 trend_ratio 확률로
+    트렌드 시드에서 뽑고, 하나라도 쓰이면 seed_origin='trend'로 태깅한다."""
     domain = taxonomy["domains"][domain_key]
     intent = rng.choice(domain["intents"])
 
     slots: dict[str, str] = {}
+    trend_used = False
     for slot in intent["slots"]:
         if slot not in pools:
             raise KeyError(f"seeds.yaml에 풀이 없음: {slot}")
-        value = rng.choice(pools[slot])
+        trend_vals = (trend_pools or {}).get(slot) or []
+        pick_trend = bool(trend_vals) and rng.random() < trend_ratio
+        pool_vals = trend_vals if pick_trend else pools[slot]
+        value = rng.choice(pool_vals)
         # 'xxx2' 슬롯은 같은 계열 풀에서 중복 없이 뽑는다 (예: fin_product2)
         base = slot[:-1] if slot.endswith("2") else None
         if base and base in slots:
-            candidates = [v for v in pools[slot] if v != slots[base]]
+            candidates = [v for v in pool_vals if v != slots[base]]
             value = rng.choice(candidates) if candidates else value
+        if pick_trend:
+            trend_used = True
         slots[slot] = value
 
     styles = taxonomy.get("styles", {})
@@ -107,6 +117,7 @@ def sample_combo(domain_key: str, taxonomy: dict, pools: dict, rng: random.Rando
         "slots": slots,
         "style": style,
         "templates": intent.get("templates", []),
+        "seed_origin": "trend" if trend_used else "base",
     }
 
 
@@ -236,6 +247,74 @@ def call_ollama_batch(combos: list[dict], host: str, model: str, temperature: fl
 
 
 # ---------------------------------------------------------------
+# 트렌드 시드 후보 추출 (기사/리뷰 붙여넣기 → 엔티티만 뽑기)
+# ---------------------------------------------------------------
+
+EXTRACT_SYSTEM_TMPL = (
+    "너는 한국어 기사·리뷰 본문에서 AI 비서 평가 질문에 쓸 '최신 엔티티'를 뽑는 추출기다.\n"
+    "규칙:\n"
+    "1) 본문에 실제로 등장한 표현만 뽑는다. 지어내거나 일반화하지 말 것.\n"
+    "2) 광고·구독 안내·기자 이름·언론사명·메뉴/배너 문구는 무시한다.\n"
+    "3) 각 항목은 아래 풀 중 정확히 하나에 배정한다:\n{pool_desc}\n"
+    "4) 어울리는 풀이 없으면 그 항목은 버린다. 값은 30자 이내 명사구.\n"
+    '5) JSON 한 개로만 출력: {{"candidates": [{{"value": "...", "pool": "..."}}]}}'
+)
+
+
+def extract_trend_candidates(text: str, pool_guide: dict[str, str],
+                             host: str = DEFAULT_HOST, model: str = DEFAULT_MODEL,
+                             max_chars: int = 3500) -> list[dict]:
+    """붙여넣은 기사/리뷰 본문에서 트렌드 시드 후보를 추출한다 (Ollama 필요).
+
+    pool_guide: {풀 이름: 설명}. 반환: [{"value": ..., "pool": ...}] — pool은
+    pool_guide에 있는 것만, 값은 정제·중복 제거됨. 본문 원문은 저장하지 않는다.
+    본문은 max_chars에서 자른다 (CPU prefill 비용 억제).
+    """
+    pool_desc = "\n".join(f"- {p}: {d}" for p, d in pool_guide.items())
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": EXTRACT_SYSTEM_TMPL.format(pool_desc=pool_desc)},
+            {"role": "user", "content": text[:max_chars]},
+        ],
+        "stream": False,
+        "format": "json",
+        "think": False,
+        "keep_alive": KEEP_ALIVE,
+        "options": {"temperature": 0.2, "num_predict": 800},
+    }
+    r = requests.post(f"{host}/api/chat", json=payload, timeout=600)
+    r.raise_for_status()
+    content = r.json().get("message", {}).get("content", "")
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", content, flags=re.S)
+        try:
+            data = json.loads(m.group()) if m else {}
+        except json.JSONDecodeError:
+            data = {}
+    cands = data.get("candidates")
+    if not isinstance(cands, list):
+        cands = []
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for c in cands:
+        if not isinstance(c, dict):
+            continue
+        value = str(c.get("value", "")).strip()
+        pool = str(c.get("pool", "")).strip()
+        if not value or len(value) > 30 or pool not in pool_guide:
+            continue
+        if (value, pool) in seen:
+            continue
+        seen.add((value, pool))
+        out.append({"value": value, "pool": pool})
+    return out
+
+
+# ---------------------------------------------------------------
 # 검증
 # ---------------------------------------------------------------
 
@@ -330,6 +409,8 @@ def generate(
     batch: int = DEFAULT_BATCH,
     exemplars: list[dict] | None = None,
     existing_questions: list[str] | None = None,
+    trend_pools: dict[str, list[str]] | None = None,
+    trend_ratio: float = 0.0,
     on_progress=None,
 ) -> list[dict]:
     """질문 레코드 리스트를 반환. on_progress(done, total)로 진행 콜백 지원(UI용).
@@ -339,6 +420,9 @@ def generate(
 
     existing_questions: 과거 실행에서 이미 생성된 질문 텍스트 목록. 주어지면 이번
     실행분이 과거분과 완전/준중복되지 않도록 막는다 (실행 간 다양성 보장).
+
+    trend_pools/trend_ratio: 최신 기사·리뷰에서 추출한 트렌드 시드({풀: [값...]})와
+    주입 확률. 트렌드 값이 쓰인 질문은 seed_origin='trend'로 태깅된다.
     """
     taxonomy = load_taxonomy()
     pools = load_seeds()
@@ -371,7 +455,8 @@ def generate(
     while len(records) < count:
         n = min(batch, count - len(records)) if mode == "ollama" else 1
         combos = [
-            sample_combo(domains[(len(records) + i) % len(domains)], taxonomy, pools, rng)
+            sample_combo(domains[(len(records) + i) % len(domains)], taxonomy, pools, rng,
+                         trend_pools, trend_ratio)
             for i in range(n)
         ]
 
@@ -425,6 +510,7 @@ def generate(
                 "gen_mode": gen_mode,
                 "model": model if gen_mode == "ollama" else None,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
+                "seed_origin": combo.get("seed_origin", "base"),
             })
             seen_exact.add(_normalize(question))
             accepted_trigrams.append(_trigrams(question))

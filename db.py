@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -56,6 +56,16 @@ def init_db() -> None:
             reviewer          TEXT,            -- 테스터
             reviewed_at       TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS trend_seeds (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            value      TEXT NOT NULL,           -- 시드 값 (예: 두쫀쿠)
+            pool       TEXT NOT NULL,           -- 주입할 슬롯 풀 이름 (예: food_category)
+            source     TEXT,                    -- 출처 메모 (기사 제목·URL)
+            added_at   TEXT NOT NULL,
+            expires_at TEXT,                    -- YYYY-MM-DD, NULL이면 무기한
+            active     INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(value, pool)
+        );
         """)
         # 구버전 DB 마이그레이션 (컬럼 없으면 추가)
         cols = {row[1] for row in conn.execute("PRAGMA table_info(reviews)")}
@@ -63,6 +73,11 @@ def init_db() -> None:
                     "output_comment", "search_id", "phase"):
             if col not in cols:
                 conn.execute(f"ALTER TABLE reviews ADD COLUMN {col} TEXT")
+        qcols = {row[1] for row in conn.execute("PRAGMA table_info(questions)")}
+        if "seed_origin" not in qcols:
+            # base=기본 시드, trend=트렌드 시드 사용 질문 (최신성 분석용)
+            conn.execute(
+                "ALTER TABLE questions ADD COLUMN seed_origin TEXT NOT NULL DEFAULT 'base'")
 
 
 def insert_questions(records: list[dict]) -> int:
@@ -73,6 +88,7 @@ def insert_questions(records: list[dict]) -> int:
             json.dumps(r["slots"], ensure_ascii=False),
             json.dumps(r["style"], ensure_ascii=False),
             r["question"], r["gen_mode"], r.get("model"), r["created_at"],
+            r.get("seed_origin", "base"),
         )
         for r in records
     ]
@@ -80,8 +96,8 @@ def insert_questions(records: list[dict]) -> int:
         cur = conn.executemany(
             "INSERT OR IGNORE INTO questions "
             "(id, domain, domain_name, intent, intent_name, slots_json, style_json,"
-            " question, gen_mode, model, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            " question, gen_mode, model, created_at, seed_origin) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
         return cur.rowcount
@@ -233,6 +249,62 @@ def curation_df() -> pd.DataFrame:
         )
 
 
+# ---------------------------------------------------------------
+# 트렌드 시드 (최신 기사·리뷰에서 추출한 엔티티 — 생성 시 슬롯에 혼입)
+# ---------------------------------------------------------------
+
+def add_trend_seeds(items: list[dict]) -> int:
+    """트렌드 시드 등록. (값, 풀) 중복은 무시. items: {value, pool, source, expires_at}"""
+    now = datetime.now().isoformat(timespec="seconds")
+    with get_conn() as conn:
+        cur = conn.executemany(
+            "INSERT OR IGNORE INTO trend_seeds (value, pool, source, added_at, expires_at)"
+            " VALUES (?,?,?,?,?)",
+            [(i["value"], i["pool"], i.get("source", ""), now, i.get("expires_at"))
+             for i in items],
+        )
+        return cur.rowcount
+
+
+def active_trend_seeds() -> dict[str, list[str]]:
+    """유효한(활성 + 미만료) 트렌드 시드를 {풀: [값, ...]} 형태로 반환 (생성 주입용)."""
+    today = date.today().isoformat()
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT pool, value FROM trend_seeds WHERE active=1"
+            " AND (expires_at IS NULL OR expires_at >= ?)",
+            (today,),
+        ).fetchall()
+    pools: dict[str, list[str]] = {}
+    for r in rows:
+        pools.setdefault(r["pool"], []).append(r["value"])
+    return pools
+
+
+def trend_seeds_df() -> pd.DataFrame:
+    """트렌드 시드 전체 목록 (관리 UI용, 만료 여부 표시)."""
+    today = date.today().isoformat()
+    with get_conn() as conn:
+        df = pd.read_sql_query(
+            "SELECT id, value AS 값, pool AS 풀, source AS 출처,"
+            " added_at AS 등록일시, expires_at AS 만료일, active"
+            " FROM trend_seeds ORDER BY added_at DESC, id DESC",
+            conn,
+        )
+    if not df.empty:
+        df["상태"] = ["활성" if a == 1 and (e == "" or e >= today) else "만료/중지"
+                      for a, e in zip(df["active"], df["만료일"].fillna(""))]
+        df = df.drop(columns=["active"])
+    return df
+
+
+def delete_trend_seeds(ids: list[int]) -> int:
+    with get_conn() as conn:
+        cur = conn.executemany(
+            "DELETE FROM trend_seeds WHERE id=?", [(int(i),) for i in ids])
+        return cur.rowcount
+
+
 def questions_df() -> pd.DataFrame:
     with get_conn() as conn:
         return pd.read_sql_query(
@@ -253,7 +325,7 @@ def results_df() -> pd.DataFrame:
             " r.output_verdict AS '2) LLM 출력', r.output_error_type AS '오류 유형',"
             " r.output_comment AS '출력 오류 코멘트',"
             " q.domain_name AS 도메인, q.intent_name AS 인텐트, r.response AS '앱 응답',"
-            " q.gen_mode AS 생성모드, q.id AS 질문ID"
+            " q.gen_mode AS 생성모드, q.seed_origin AS 시드출처, q.id AS 질문ID"
             " FROM reviews r JOIN questions q ON q.id = r.question_id"
             " ORDER BY r.reviewed_at",
             conn,
