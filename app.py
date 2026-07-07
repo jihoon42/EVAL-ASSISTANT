@@ -279,8 +279,31 @@ if page == "② 검수 진행":
         current = None
         st.info("대기 중인 질문이 없습니다. ① 탭에서 질문을 생성하세요.")
     else:
-        # 선택 검수: 기본은 대기열 맨 앞, 드롭다운에 타이핑하면 검색됨 (예: "바비").
-        # 선택한 질문을 저장/건너뛰기/제외하면 대기열에서 빠지므로 자동으로 맨 앞으로 복귀.
+        # 묶어서 검수: 같은 인텐트 질문을 연달아 진행. 대기열의 저장 순서(DB)는 불변 —
+        # ② 탭에서 보여주고 이어가는 순서만 좁힌다. 묶음이 소진되면 전체로 복귀.
+        group_counts: dict[str, int] = {}
+        for q in queue:
+            g = f"{q['domain_name']}/{q['intent_name']}"
+            group_counts[g] = group_counts.get(g, 0) + 1
+        group_options = ["전체"] + sorted(group_counts)
+        prev_group = st.session_state.get("review_group")
+        if prev_group is not None and prev_group not in group_options:
+            st.session_state.pop("review_group", None)
+            if prev_group != "전체":
+                st.toast(f"'{prev_group}' 묶음 검수를 마쳤습니다. 전체 대기열로 돌아갑니다.")
+
+        fc1, fc2 = st.columns([1, 2])
+        with fc1:
+            group = st.selectbox(
+                "묶어서 검수 (인텐트)", group_options, key="review_group",
+                format_func=lambda g: g if g == "전체" else f"{g} ({group_counts[g]}건)",
+                help="선택하면 이 인텐트의 질문만 순서대로 이어서 검수합니다. "
+                     "대기열 순서 자체는 바뀌지 않습니다.")
+        if group != "전체":
+            queue = [q for q in queue if f"{q['domain_name']}/{q['intent_name']}" == group]
+
+        # 선택 검수: 기본은 (묶음 내) 맨 앞, 드롭다운에 타이핑하면 검색됨 (예: "바비").
+        # 선택한 질문을 저장/건너뛰기/제외하면 대기열에서 빠지므로 자동으로 다음으로 넘어간다.
         queue_ids = [q["id"] for q in queue]
         queue_labels = {
             q["id"]: f"{i + 1}. [{q['domain_name']}/{q['intent_name']}] {q['question'][:60]}"
@@ -288,10 +311,11 @@ if page == "② 검수 진행":
         }
         if st.session_state.get("review_pick") not in queue_ids:
             st.session_state.pop("review_pick", None)
-        pick = st.selectbox(
-            "검수할 질문 — 기본은 대기열 맨 앞, 입력해서 검색·선택하면 그 질문을 바로 검수",
-            queue_ids, format_func=lambda i: queue_labels[i], key="review_pick",
-        )
+        with fc2:
+            pick = st.selectbox(
+                "검수할 질문 — 기본은 맨 앞, 입력해서 검색·선택하면 그 질문을 바로 검수",
+                queue_ids, format_func=lambda i: queue_labels[i], key="review_pick",
+            )
         current = next(q for q in queue if q["id"] == pick)
 
         left, right = st.columns([3, 2])
