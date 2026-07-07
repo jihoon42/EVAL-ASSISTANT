@@ -168,8 +168,11 @@ with tab_gen:
         st.caption("정리할 질문이 없습니다. (검수 완료 건은 여기 나오지 않습니다)")
     else:
         st.caption(
+            "표는 **실제 검수 순서**로 정렬되고 대기 건에는 순번이 붙습니다. "
             "체크박스로 질문을 선택하세요 (헤더 체크박스 = 전체 선택). "
-            "**결함 제외**는 기록이 남아 생성 품질 신호로 쓰이고, **영구 삭제**는 DB에서 흔적 없이 지웁니다."
+            "**먼저 검수**를 누르면 선택한 질문이 맨 위로 올라오는 것이 순번으로 보입니다. "
+            "**결함 제외**는 기록이 남아 생성 품질 신호로 쓰이고, **영구 삭제**는 DB에서 흔적 없이 지웁니다. "
+            "특정 질문 하나를 지금 바로 검수하려면 ② 탭 상단 드롭다운에서 검색해 선택하세요."
         )
         event = st.dataframe(
             curation, width="stretch", hide_index=True,
@@ -179,7 +182,13 @@ with tab_gen:
         )
         sel_rows = [i for i in event.selection.rows if i < len(curation)]
         sel_ids = curation.iloc[sel_rows]["id"].tolist()
-        c1, c2, c3 = st.columns(3)
+        c0, c1, c2, c3 = st.columns(4)
+        if c0.button(f"선택 {len(sel_ids)}건 먼저 검수", disabled=not sel_ids,
+                     help="선택한 질문을 검수 대기열 맨 앞으로 보냅니다. "
+                          "건너뛰거나 제외했던 질문도 대기로 복원됩니다."):
+            db.prioritize_questions(sel_ids)
+            st.toast(f"{len(sel_ids)}건을 맨 앞으로 보냈습니다. ② 탭에서 바로 검수하세요.")
+            st.rerun()
         if c1.button(f"선택 {len(sel_ids)}건 결함 제외", disabled=not sel_ids,
                      help="비문 등 별로인 질문. 검수 대상에서 빠지고 few-shot 예시에서도 배제됩니다."):
             db.reject_questions(sel_ids)
@@ -251,10 +260,26 @@ with tab_review:
                     st.toast("추가했습니다. 바로 아래에서 검수하세요.")
                     st.rerun()
 
-    current = db.next_pending()
-    if current is None:
+    queue = db.pending_queue()
+    if not queue:
+        current = None
         st.info("대기 중인 질문이 없습니다. ① 탭에서 질문을 생성하세요.")
     else:
+        # 선택 검수: 기본은 대기열 맨 앞, 드롭다운에 타이핑하면 검색됨 (예: "바비").
+        # 선택한 질문을 저장/건너뛰기/제외하면 대기열에서 빠지므로 자동으로 맨 앞으로 복귀.
+        queue_ids = [q["id"] for q in queue]
+        queue_labels = {
+            q["id"]: f"{i + 1}. [{q['domain_name']}/{q['intent_name']}] {q['question'][:60]}"
+            for i, q in enumerate(queue)
+        }
+        if st.session_state.get("review_pick") not in queue_ids:
+            st.session_state.pop("review_pick", None)
+        pick = st.selectbox(
+            "검수할 질문 — 기본은 대기열 맨 앞, 입력해서 검색·선택하면 그 질문을 바로 검수",
+            queue_ids, format_func=lambda i: queue_labels[i], key="review_pick",
+        )
+        current = next(q for q in queue if q["id"] == pick)
+
         left, right = st.columns([3, 2])
         with left:
             st.subheader("이 질문을 카나나 앱에 붙여넣기")
@@ -266,6 +291,33 @@ with tab_review:
                 f"도메인 **{current['domain_name']}** / 인텐트 **{current['intent_name']}** / "
                 + " · ".join(f"{k}={v}" for k, v in slots.items())
             )
+
+            with st.expander("✏️ 질문 다듬기 — 조금만 고치면 쓸 수 있을 때"):
+                st.caption(
+                    "비문·어색한 어미만 고치면 되는 질문은 버리지 말고 여기서 고치세요. "
+                    "고친 질문이 검수를 통과하면 few-shot 예시로 재사용되어, 좋은 예시를 "
+                    "하나 더 만드는 효과가 있습니다. 필수 엔티티는 유지해야 합니다."
+                )
+                new_q = st.text_input("질문 수정", value=current["question"],
+                                      key=f"edit_q_{current['id']}")
+                if st.button("수정 저장", key=f"edit_q_btn_{current['id']}"):
+                    fixed = new_q.strip()
+                    missing = [v for v in slots.values()
+                               if gen.required_token(v) not in fixed]
+                    others = db.all_question_texts()
+                    if current["question"] in others:
+                        others.remove(current["question"])  # 자기 자신 제외
+                    if not fixed:
+                        st.warning("질문이 비어 있습니다.")
+                    elif missing:
+                        st.warning("필수 엔티티가 빠졌습니다: " + ", ".join(missing))
+                    elif any(gen._normalize(t) == gen._normalize(fixed) for t in others):
+                        st.warning("같은 질문이 이미 존재합니다.")
+                    else:
+                        db.update_question_text(current["id"], fixed)
+                        st.toast("질문을 수정했습니다.")
+                        st.rerun()
+
             b1, b2 = st.columns(2)
             if b1.button("이 질문 건너뛰기"):
                 db.skip_question(current["id"])

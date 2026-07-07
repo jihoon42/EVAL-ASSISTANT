@@ -78,6 +78,10 @@ def init_db() -> None:
             # base=기본 시드, trend=트렌드 시드 사용 질문 (최신성 분석용)
             conn.execute(
                 "ALTER TABLE questions ADD COLUMN seed_origin TEXT NOT NULL DEFAULT 'base'")
+        if "priority" not in qcols:
+            # 1이면 검수 대기열 맨 앞 ("먼저 검수" 지정)
+            conn.execute(
+                "ALTER TABLE questions ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
 
 
 def insert_questions(records: list[dict]) -> int:
@@ -104,13 +108,38 @@ def insert_questions(records: list[dict]) -> int:
 
 
 def next_pending() -> dict | None:
-    """다음 검수 대상. 직접 추가한 질문(gen_mode='manual')이 먼저, 나머지는 생성일시 순."""
+    """다음 검수 대상. '먼저 검수' 지정(priority=1) → 직접 추가 질문(manual) → 생성일시 순."""
     with get_conn() as conn:
         row = conn.execute(
             "SELECT * FROM questions WHERE status='pending'"
-            " ORDER BY gen_mode != 'manual', created_at, rowid LIMIT 1"
+            " ORDER BY priority DESC, gen_mode != 'manual', created_at, rowid LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
+
+
+def pending_queue() -> list[dict]:
+    """검수 대기열 전체를 실제 검수 순서로 반환 (② 탭 선택 검수용)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM questions WHERE status='pending'"
+            " ORDER BY priority DESC, gen_mode != 'manual', created_at, rowid"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def prioritize_questions(ids: list[str]) -> int:
+    """선택한 질문을 검수 대기열 맨 앞으로. 건너뜀/결함 제외 상태였다면 대기로 복원한다."""
+    with get_conn() as conn:
+        cur = conn.executemany(
+            "UPDATE questions SET priority=1, status='pending' WHERE id=?",
+            [(i,) for i in ids])
+        return cur.rowcount
+
+
+def update_question_text(question_id: str, new_text: str) -> None:
+    """질문 문구 수정 (검수 전 다듬기용). 고친 질문이 검수를 통과하면 few-shot 예시가 된다."""
+    with get_conn() as conn:
+        conn.execute("UPDATE questions SET question=? WHERE id=?", (new_text, question_id))
 
 
 def status_counts() -> dict[str, int]:
@@ -238,15 +267,23 @@ def delete_questions(ids: list[str]) -> int:
 
 
 def curation_df() -> pd.DataFrame:
-    """검수 전 정리 대상 질문 목록 (검수 완료 건 제외)."""
+    """검수 전 정리 대상 질문 목록 (검수 완료 건 제외).
+    실제 검수 순서로 정렬하고 대기 건에 순번을 붙인다 — '먼저 검수'의 효과가 눈에 보이게."""
     with get_conn() as conn:
-        return pd.read_sql_query(
-            "SELECT id, status AS 상태, domain_name AS 도메인, intent_name AS 인텐트,"
-            " question AS 질의, gen_mode AS 생성모드, created_at AS 생성일시"
+        df = pd.read_sql_query(
+            "SELECT id, status AS 상태, priority AS 우선, domain_name AS 도메인,"
+            " intent_name AS 인텐트, question AS 질의, gen_mode AS 생성모드,"
+            " created_at AS 생성일시"
             " FROM questions WHERE status != 'done'"
-            " ORDER BY created_at DESC, rowid DESC",
+            " ORDER BY status != 'pending', priority DESC, gen_mode != 'manual',"
+            " created_at, rowid",
             conn,
         )
+    if not df.empty:
+        df.insert(1, "순번", "")
+        pend = df["상태"] == "pending"
+        df.loc[pend, "순번"] = [str(i) for i in range(1, int(pend.sum()) + 1)]
+    return df
 
 
 # ---------------------------------------------------------------
