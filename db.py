@@ -109,8 +109,10 @@ def status_counts() -> dict[str, int]:
 def save_review(question_id: str, response: str,
                 accuracy_verdict: str, fail_type: str, accuracy_comment: str,
                 output_verdict: str, output_error_type: str, output_comment: str,
-                search_id: str, reviewer: str, phase: str) -> None:
-    now = datetime.now().isoformat(timespec="seconds")
+                search_id: str, reviewer: str, phase: str,
+                reviewed_at: str | None = None) -> None:
+    """reviewed_at을 주면 그 값을 유지한다 (기존 검수 수정 시 검수일시 보존용)."""
+    now = reviewed_at or datetime.now().isoformat(timespec="seconds")
     with get_conn() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO reviews (question_id, response, verdict, fail_type, reason,"
@@ -121,6 +123,38 @@ def save_review(question_id: str, response: str,
              reviewer, now),
         )
         conn.execute("UPDATE questions SET status='done' WHERE id=?", (question_id,))
+
+
+def review_detail(question_id: str) -> dict | None:
+    """검수 1건 + 질문 정보 (수정 폼 프리필용)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT r.*, q.question, q.domain_name, q.intent_name"
+            " FROM reviews r JOIN questions q ON q.id = r.question_id"
+            " WHERE r.question_id = ?", (question_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def reopen_review(question_id: str) -> None:
+    """검수 기록을 지우고 질문을 재검수 대기로 되돌린다 (저장 실수 복구용)."""
+    with get_conn() as conn:
+        conn.execute("DELETE FROM reviews WHERE question_id=?", (question_id,))
+        conn.execute("UPDATE questions SET status='pending' WHERE id=?", (question_id,))
+
+
+def duplicate_review_fields(question_id: str, search_id: str, response: str) -> list[str]:
+    """다른 검수 기록과 값이 똑같은 필드 목록 (직전 답변 붙여넣기 실수 감지용)."""
+    dups: list[str] = []
+    with get_conn() as conn:
+        if search_id and conn.execute(
+                "SELECT 1 FROM reviews WHERE search_id=? AND question_id!=? LIMIT 1",
+                (search_id, question_id)).fetchone():
+            dups.append("search ID")
+        if response and conn.execute(
+                "SELECT 1 FROM reviews WHERE response=? AND question_id!=? LIMIT 1",
+                (response, question_id)).fetchone():
+            dups.append("앱 응답")
+    return dups
 
 
 def skip_question(question_id: str) -> None:

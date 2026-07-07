@@ -247,34 +247,56 @@ with tab_review:
 
         with right:
             st.subheader("검수 결과 기록")
-            with st.form("review_form", clear_on_submit=True):
+            # 저장 성공 직후에만 폼을 비운다 — 경고에 걸렸을 땐 입력(긴 응답 붙여넣기)을 보존
+            if st.session_state.pop("review_clear", False):
+                st.session_state.update({
+                    "rv_response": "", "rv_search": "",
+                    "rv_acc": VERDICTS[0], "rv_fail": [], "rv_acc_comment": "",
+                    "rv_out": VERDICTS[0], "rv_err": [], "rv_out_comment": "",
+                    "rv_allow_dup": False,
+                })
+            with st.form("review_form"):
                 response = st.text_area(
-                    "카나나 앱 응답 (전문 붙여넣기 — 내부 분석용)", height=160,
+                    "카나나 앱 응답 (전문 붙여넣기 — 내부 분석용)", height=160, key="rv_response",
                     placeholder="앱에서 받은 응답을 그대로 붙여넣으세요.",
                 )
-                search_id = st.text_input("search ID (앱에서 확인 가능하면 입력)")
+                search_id = st.text_input(
+                    "search ID (응답을 받으면 앱에 반드시 함께 생성됩니다)", key="rv_search")
 
                 st.markdown("**1) 정확도**")
                 acc_verdict = st.radio("정확도 판정", VERDICTS, horizontal=True,
-                                       label_visibility="collapsed")
-                fail_types = st.multiselect("N 사유 (fail 시 선택)", FAIL_TYPES)
-                acc_comment = st.text_input("정확도 코멘트")
+                                       label_visibility="collapsed", key="rv_acc")
+                fail_types = st.multiselect("N 사유 (fail 시 선택)", FAIL_TYPES, key="rv_fail")
+                acc_comment = st.text_input("정확도 코멘트", key="rv_acc_comment")
 
                 st.markdown("**2) LLM 출력**")
                 out_verdict = st.radio("LLM 출력 판정", VERDICTS, horizontal=True,
-                                       label_visibility="collapsed")
-                output_errors = st.multiselect("오류 유형 (fail 시 선택)", OUTPUT_ERROR_TYPES)
-                out_comment = st.text_input("출력 오류 코멘트")
+                                       label_visibility="collapsed", key="rv_out")
+                output_errors = st.multiselect("오류 유형 (fail 시 선택)", OUTPUT_ERROR_TYPES,
+                                               key="rv_err")
+                out_comment = st.text_input("출력 오류 코멘트", key="rv_out_comment")
 
+                allow_dup = st.checkbox(
+                    "이전 검수와 같은 search ID/앱 응답이어도 저장", key="rv_allow_dup",
+                    help="서로 다른 질문에 동일한 폴백 응답이 온 경우처럼 드문 상황에서만 켜세요.")
                 submitted = st.form_submit_button("저장하고 다음 →", type="primary")
 
             if submitted:
+                dup_fields = db.duplicate_review_fields(
+                    current["id"], search_id.strip(), response.strip())
                 if not response.strip():
                     st.warning("앱 응답이 비어 있습니다. 응답 전문을 붙여넣어 주세요.")
+                elif not search_id.strip():
+                    st.warning("search ID가 비어 있습니다. 응답을 받았다면 search ID도 반드시 "
+                               "생성됩니다 — 앱에서 확인해 입력해 주세요.")
                 elif acc_verdict == "fail" and not fail_types and not acc_comment.strip():
                     st.warning("정확도 fail에는 N 사유를 선택하거나 코멘트를 적어주세요.")
                 elif out_verdict == "fail" and not output_errors and not out_comment.strip():
                     st.warning("LLM 출력 fail에는 오류 유형을 선택하거나 코멘트를 적어주세요.")
+                elif dup_fields and not allow_dup:
+                    st.warning("이전 검수 기록과 동일한 **" + ", ".join(dup_fields) + "** 입니다. "
+                               "직전 답변 것을 잘못 붙여넣지 않았는지 확인해 주세요. "
+                               "실제로 같은 값이 맞다면 체크박스를 켜고 다시 저장하세요.")
                 else:
                     db.save_review(
                         current["id"], response.strip(),
@@ -288,8 +310,21 @@ with tab_review:
                         reviewer=st.session_state.get("reviewer", ""),
                         phase=st.session_state.get("phase", ""),
                     )
+                    st.session_state["last_reviewed"] = current["id"]
+                    st.session_state["review_clear"] = True
                     st.toast("저장 완료")
                     st.rerun()
+
+    last_id = st.session_state.get("last_reviewed")
+    if last_id:
+        st.divider()
+        if st.button("↩ 방금 저장한 검수 되돌리기",
+                     help="직전 저장 건의 검수 기록을 지우고 그 질문을 재검수 대기로 되돌립니다. "
+                          "붙여넣기 실수를 바로 알아챘을 때 쓰세요."):
+            db.reopen_review(last_id)
+            del st.session_state["last_reviewed"]
+            st.toast("되돌렸습니다. 해당 질문이 다시 검수 차례로 돌아옵니다.")
+            st.rerun()
 
 # ---------------------------------------------------------------
 # ③ 결과·내보내기
@@ -359,6 +394,85 @@ with tab_result:
 
         with st.expander("내부분석 전체 보기 (앱 응답·도메인·인텐트 포함)"):
             st.dataframe(results, width="stretch", hide_index=True)
+
+        with st.expander("✏️ 검수 기록 수정·삭제 — 잘못 붙여넣은 응답·search ID, 코멘트 오타 교정"):
+            qids = results["질문ID"].tolist()[::-1]  # 최근 검수가 위로
+            by_qid = results.set_index("질문ID")
+            if st.session_state.get("edit_target") not in qids:
+                st.session_state.pop("edit_target", None)
+
+            def fmt_review(qid: str) -> str:
+                row = by_qid.loc[qid]
+                return f"{row['검수일시']} | {row['search ID']} | {row['검색 키워드'][:40]}"
+
+            target = st.selectbox("수정할 검수 건", qids, format_func=fmt_review,
+                                  key="edit_target")
+            detail = db.review_detail(target)
+            if detail is None:
+                st.warning("기록을 찾을 수 없습니다.")
+            else:
+                with st.form(f"edit_review_{target}"):
+                    e_response = st.text_area("카나나 앱 응답", value=detail["response"],
+                                              height=140, key=f"ed_resp_{target}")
+                    e_search = st.text_input("search ID", value=detail["search_id"] or "",
+                                             key=f"ed_sid_{target}")
+                    e_acc = st.radio(
+                        "1) 정확도", VERDICTS, horizontal=True, key=f"ed_acc_{target}",
+                        index=VERDICTS.index(detail["verdict"]) if detail["verdict"] in VERDICTS else 0)
+                    stored_fail = [v for v in (detail["fail_type"] or "").split(", ") if v]
+                    fail_opts = FAIL_TYPES + [v for v in stored_fail if v not in FAIL_TYPES]
+                    e_fail = st.multiselect("N 사유 (fail 시)", fail_opts, default=stored_fail,
+                                            key=f"ed_fail_{target}")
+                    e_acc_c = st.text_input("정확도 코멘트", value=detail["reason"] or "",
+                                            key=f"ed_accc_{target}")
+                    e_out = st.radio(
+                        "2) LLM 출력", VERDICTS, horizontal=True, key=f"ed_out_{target}",
+                        index=VERDICTS.index(detail["output_verdict"]) if detail["output_verdict"] in VERDICTS else 0)
+                    stored_err = [v for v in (detail["output_error_type"] or "").split(", ") if v]
+                    err_opts = OUTPUT_ERROR_TYPES + [v for v in stored_err if v not in OUTPUT_ERROR_TYPES]
+                    e_err = st.multiselect("오류 유형 (fail 시)", err_opts, default=stored_err,
+                                           key=f"ed_err_{target}")
+                    e_out_c = st.text_input("출력 오류 코멘트", value=detail["output_comment"] or "",
+                                            key=f"ed_outc_{target}")
+                    e_allow_dup = st.checkbox("다른 검수와 같은 search ID/앱 응답이어도 저장",
+                                              key=f"ed_dup_{target}")
+                    save_edit = st.form_submit_button("수정 저장 (검수일시·테스터는 원본 유지)",
+                                                      type="primary")
+                if save_edit:
+                    dup_fields = db.duplicate_review_fields(
+                        target, e_search.strip(), e_response.strip())
+                    if not e_response.strip() or not e_search.strip():
+                        st.warning("앱 응답과 search ID는 비울 수 없습니다.")
+                    elif e_acc == "fail" and not e_fail and not e_acc_c.strip():
+                        st.warning("정확도 fail에는 N 사유를 선택하거나 코멘트를 적어주세요.")
+                    elif e_out == "fail" and not e_err and not e_out_c.strip():
+                        st.warning("LLM 출력 fail에는 오류 유형을 선택하거나 코멘트를 적어주세요.")
+                    elif dup_fields and not e_allow_dup:
+                        st.warning("다른 검수 기록과 동일한 **" + ", ".join(dup_fields) + "** 입니다. "
+                                   "확인 후 체크박스를 켜고 저장하세요.")
+                    else:
+                        db.save_review(
+                            target, e_response.strip(),
+                            accuracy_verdict=e_acc, fail_type=", ".join(e_fail),
+                            accuracy_comment=e_acc_c.strip(),
+                            output_verdict=e_out, output_error_type=", ".join(e_err),
+                            output_comment=e_out_c.strip(), search_id=e_search.strip(),
+                            reviewer=detail["reviewer"], phase=detail["phase"],
+                            reviewed_at=detail["reviewed_at"],
+                        )
+                        st.toast("수정했습니다.")
+                        st.rerun()
+                d1, d2 = st.columns(2)
+                if d1.button("↩ 재검수로 되돌리기",
+                             help="검수 기록을 지우고 이 질문을 다시 검수 대기로 보냅니다."):
+                    db.reopen_review(target)
+                    st.toast("재검수 대기로 되돌렸습니다. ② 탭에서 다시 검수하세요.")
+                    st.rerun()
+                if d2.button("🗑 이 건 영구 삭제 (질문+검수 기록)",
+                             help="질문과 검수 기록을 DB에서 완전히 제거합니다. 되돌릴 수 없습니다."):
+                    db.delete_questions([target])
+                    st.toast("삭제했습니다.")
+                    st.rerun()
 
         # ---- xlsx 추출: '제출양식' 시트는 위 표와 동일, 헤더는 양식 원래 이름 그대로 ----
         submit_x = submit.copy()
