@@ -173,11 +173,15 @@ def build_few_shot(exemplars: list[dict]) -> tuple[str, str]:
 
 
 def build_batch_prompt(combos: list[dict]) -> str:
+    """스펙 라인 구성. 슬롯/말투가 빈 스펙(직접 작성 질문 예시)도 자연스럽게 렌더링한다."""
     lines = []
     for i, c in enumerate(combos, 1):
+        parts = [f"{c['domain_name']}/{c['intent_name']}"]
         required = ", ".join(c["slots"].values())
-        style = ", ".join(c["style"].values())
-        lines.append(f"[스펙 {i}] {c['domain_name']}/{c['intent_name']} | 필수 포함: {required} | 말투: {style}")
+        if required:
+            parts.append(f"필수 포함: {required}")
+        parts.append(f"말투: {', '.join(c['style'].values()) or '자유'}")
+        lines.append(f"[스펙 {i}] " + " | ".join(parts))
     return "\n".join(lines)
 
 
@@ -253,6 +257,23 @@ def is_near_duplicate(question: str, accepted_trigrams: list[set[str]]) -> bool:
     return False
 
 
+def similar_questions(question: str, candidates: list[str],
+                      threshold: float = 0.5, top_k: int = 3) -> list[str]:
+    """과거 질문 중 비슷한 것을 유사도 순으로 반환 (직접 추가 시 중복 검수 경고용).
+    생성 중복 기준(0.85)은 거의 같은 문자열만 잡으므로, 사람 눈에 '사실상 같은 질문'을
+    넓게 잡도록 임계값을 낮춰서 쓴다. 경고일 뿐 추가를 막지는 않는다."""
+    tg = _trigrams(question)
+    scored = []
+    for c in candidates:
+        other = _trigrams(c)
+        union = tg | other
+        score = len(tg & other) / len(union) if union else 0.0
+        if score >= threshold:
+            scored.append((score, c))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in scored[:top_k]]
+
+
 def required_token(value: str) -> str:
     """검사용 필수 문자열. 괄호 보충어는 완화한다. 예: '골프장(필드)' -> '골프장'"""
     return value.split("(")[0].strip()
@@ -308,12 +329,16 @@ def generate(
     seed: int | None = None,
     batch: int = DEFAULT_BATCH,
     exemplars: list[dict] | None = None,
+    existing_questions: list[str] | None = None,
     on_progress=None,
 ) -> list[dict]:
     """질문 레코드 리스트를 반환. on_progress(done, total)로 진행 콜백 지원(UI용).
 
     exemplars: 검수를 통과한 실제 질문 레코드 목록. 주어지면 few-shot 예시로 사용되어
     사용(검수)이 쌓일수록 생성 품질이 따라 올라간다. 없으면 기본 예시 사용.
+
+    existing_questions: 과거 실행에서 이미 생성된 질문 텍스트 목록. 주어지면 이번
+    실행분이 과거분과 완전/준중복되지 않도록 막는다 (실행 간 다양성 보장).
     """
     taxonomy = load_taxonomy()
     pools = load_seeds()
@@ -337,8 +362,9 @@ def generate(
     few_shot = build_few_shot(pool_ex[:6])
 
     records: list[dict] = []
-    seen_exact: set[str] = set()
-    accepted_trigrams: list[set[str]] = []
+    # 과거 실행분을 중복 검사 기준에 미리 넣는다 — 세션을 거듭해도 준중복이 쌓이지 않게
+    seen_exact: set[str] = {_normalize(q) for q in existing_questions or []}
+    accepted_trigrams: list[set[str]] = [_trigrams(q) for q in existing_questions or []]
     failures = 0
     batch = max(1, batch)
 
@@ -438,16 +464,25 @@ def main() -> None:
     args = p.parse_args()
 
     domains = [d.strip() for d in args.domain.split(",") if d.strip()]
-    records = generate(
-        count=args.count, domains=domains, mode=args.mode, model=args.model,
-        host=args.host, temperature=args.temperature, seed=args.seed, batch=args.batch,
-        on_progress=lambda d, t: print(f"\r생성 중... {d}/{t}", end="", file=sys.stderr),
-    )
-    print(file=sys.stderr)
 
     out_path = Path(args.out)
     if not out_path.is_absolute():
         out_path = BASE_DIR / out_path
+    # 출력 파일에 이미 쌓인 질문과 중복되지 않게 (append 운용 전제)
+    existing: list[str] = []
+    if out_path.exists():
+        with open(out_path, encoding="utf-8") as f:
+            existing = [json.loads(line)["question"] for line in f if line.strip()]
+        print(f"기존 {len(existing)}건과 중복 방지: {out_path}", file=sys.stderr)
+
+    records = generate(
+        count=args.count, domains=domains, mode=args.mode, model=args.model,
+        host=args.host, temperature=args.temperature, seed=args.seed, batch=args.batch,
+        existing_questions=existing,
+        on_progress=lambda d, t: print(f"\r생성 중... {d}/{t}", end="", file=sys.stderr),
+    )
+    print(file=sys.stderr)
+
     save_jsonl(records, out_path)
     print(f"{len(records)}건 저장: {out_path}", file=sys.stderr)
 

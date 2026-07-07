@@ -88,9 +88,11 @@ def insert_questions(records: list[dict]) -> int:
 
 
 def next_pending() -> dict | None:
+    """다음 검수 대상. 직접 추가한 질문(gen_mode='manual')이 먼저, 나머지는 생성일시 순."""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM questions WHERE status='pending' ORDER BY created_at, rowid LIMIT 1"
+            "SELECT * FROM questions WHERE status='pending'"
+            " ORDER BY gen_mode != 'manual', created_at, rowid LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
 
@@ -134,12 +136,14 @@ def reject_question(question_id: str) -> None:
 
 def exemplar_records(limit: int = 6) -> list[dict]:
     """검수를 통과한(검수자가 정상 질문으로 취급한) 질문을 few-shot 예시용으로 샘플링.
+    도메인별로 돌아가며 뽑아(라운드 로빈) 특정 도메인 쏠림을 막는다.
     사용이 쌓일수록 예시 풀이 커져 생성 품질이 따라 올라간다."""
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT domain_name, intent_name, slots_json, style_json, question"
-            " FROM questions WHERE status='done'"
-            " ORDER BY RANDOM() LIMIT ?",
+            "SELECT domain_name, intent_name, slots_json, style_json, question FROM ("
+            "  SELECT *, ROW_NUMBER() OVER (PARTITION BY domain ORDER BY RANDOM()) AS rn"
+            "  FROM questions WHERE status='done'"
+            ") ORDER BY rn LIMIT ?",
             (limit,),
         ).fetchall()
     return [
@@ -158,6 +162,41 @@ def restore_skipped() -> int:
     with get_conn() as conn:
         cur = conn.execute("UPDATE questions SET status='pending' WHERE status='skipped'")
         return cur.rowcount
+
+
+def all_question_texts() -> list[str]:
+    """지금까지 생성된 모든 질문 텍스트 (상태 무관).
+    생성 시 넘겨주면 과거 실행분과의 완전/준중복을 막는다."""
+    with get_conn() as conn:
+        return [r[0] for r in conn.execute("SELECT question FROM questions")]
+
+
+def reject_questions(ids: list[str]) -> int:
+    """여러 질문을 한꺼번에 결함 제외. 기록은 남고 few-shot 예시에서 배제된다."""
+    with get_conn() as conn:
+        cur = conn.executemany(
+            "UPDATE questions SET status='rejected' WHERE id=?", [(i,) for i in ids])
+        return cur.rowcount
+
+
+def delete_questions(ids: list[str]) -> int:
+    """질문을 DB에서 완전히 제거 (흔적 없음). 딸린 검수 기록이 있으면 함께 지운다."""
+    with get_conn() as conn:
+        conn.executemany("DELETE FROM reviews WHERE question_id=?", [(i,) for i in ids])
+        cur = conn.executemany("DELETE FROM questions WHERE id=?", [(i,) for i in ids])
+        return cur.rowcount
+
+
+def curation_df() -> pd.DataFrame:
+    """검수 전 정리 대상 질문 목록 (검수 완료 건 제외)."""
+    with get_conn() as conn:
+        return pd.read_sql_query(
+            "SELECT id, status AS 상태, domain_name AS 도메인, intent_name AS 인텐트,"
+            " question AS 질의, gen_mode AS 생성모드, created_at AS 생성일시"
+            " FROM questions WHERE status != 'done'"
+            " ORDER BY created_at DESC, rowid DESC",
+            conn,
+        )
 
 
 def questions_df() -> pd.DataFrame:
