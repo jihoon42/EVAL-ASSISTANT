@@ -31,6 +31,11 @@ SEEDS_PATH = BASE_DIR / "seeds.yaml"
 DEFAULT_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3:4b"
 
+# localhost(Ollama) 호출 전용 세션. trust_env=False로 시스템 프록시/WPAD를 우회한다 —
+# 윈도우에서 프록시 설정이 있으면 localhost 요청조차 프록시를 타려다 수 초씩 지연될 수 있음.
+_session = requests.Session()
+_session.trust_env = False
+
 MIN_LEN, MAX_LEN = 6, 90        # 질문 길이 허용 범위(문자)
 DEDUP_JACCARD = 0.85            # 문자 trigram 유사도 임계값
 DEFAULT_BATCH = 8               # LLM 호출 1회당 생성 질문 수 (고정 프롬프트 prefill 비용을 N분의 1로)
@@ -79,6 +84,12 @@ def load_taxonomy() -> dict:
 # ---------------------------------------------------------------
 # 슬롯 조합 샘플링
 # ---------------------------------------------------------------
+
+def combo_key(intent: str, slots: dict[str, str]) -> str:
+    """(인텐트, 엔티티 값들)로 만든 조합 식별자.
+    문자 유사도 검사는 조사 하나만 달라도 통과시키므로(짧은 문장에서 trigram 급락),
+    '같은 것을 또 묻는' 중복은 문구가 아니라 이 조합 단위로 회피한다."""
+    return intent + "|" + "|".join(sorted(slots.values()))
 
 def sample_combo(domain_key: str, taxonomy: dict, pools: dict, rng: random.Random,
                  trend_pools: dict[str, list[str]] | None = None,
@@ -215,7 +226,7 @@ def build_batch_prompt(combos: list[dict]) -> str:
 
 def check_ollama(host: str) -> bool:
     try:
-        r = requests.get(f"{host}/api/tags", timeout=2)
+        r = _session.get(f"{host}/api/tags", timeout=2)
         return r.status_code == 200
     except requests.RequestException:
         return False
@@ -243,7 +254,7 @@ def call_ollama_batch(combos: list[dict], host: str, model: str, temperature: fl
             "num_predict": 100 * len(combos) + 50,  # 출력 폭주 방지 상한
         },
     }
-    r = requests.post(f"{host}/api/chat", json=payload, timeout=600)
+    r = _session.post(f"{host}/api/chat", json=payload, timeout=600)
     r.raise_for_status()
     content = r.json().get("message", {}).get("content", "")
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
@@ -300,7 +311,7 @@ def extract_trend_candidates(text: str, pool_guide: dict[str, str],
         "keep_alive": KEEP_ALIVE,
         "options": {"temperature": 0.2, "num_predict": 800},
     }
-    r = requests.post(f"{host}/api/chat", json=payload, timeout=600)
+    r = _session.post(f"{host}/api/chat", json=payload, timeout=600)
     r.raise_for_status()
     content = r.json().get("message", {}).get("content", "")
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
@@ -428,7 +439,9 @@ def generate(
     existing_questions: list[str] | None = None,
     trend_pools: dict[str, list[str]] | None = None,
     trend_ratio: float = 0.0,
+    existing_combos: set[str] | None = None,
     on_progress=None,
+    on_record=None,
 ) -> list[dict]:
     """질문 레코드 리스트를 반환. on_progress(done, total)로 진행 콜백 지원(UI용).
 
@@ -436,7 +449,15 @@ def generate(
     사용(검수)이 쌓일수록 생성 품질이 따라 올라간다. 없으면 기본 예시 사용.
 
     existing_questions: 과거 실행에서 이미 생성된 질문 텍스트 목록. 주어지면 이번
-    실행분이 과거분과 완전/준중복되지 않도록 막는다 (실행 간 다양성 보장).
+    실행분이 과거분과 완전/준중복(문자 기준)되지 않도록 막는다. 단, 문자 검사는
+    거의 동일한 문구만 잡으므로 '같은 주제 반복'은 existing_combos가 담당한다.
+
+    existing_combos: 이미 다룬 (인텐트, 엔티티) 조합 키 집합 (combo_key() 형식).
+    이번 실행 내 중복 포함, 이미 나온 조합은 피해서 샘플링한다 — 예: '주택청약
+    1순위 조건'을 문구만 바꿔 또 묻는 것 방지. 조합 공간이 소진되면 반복 허용.
+
+    on_record: 질문 1건이 확정될 때마다 호출되는 콜백(레코드 1개). UI에서 즉시
+    저장용으로 쓰면 생성이 도중에 중단(rerun 등)되어도 그때까지의 결과가 보존된다.
 
     trend_pools/trend_ratio: 최신 기사·리뷰에서 추출한 트렌드 시드({풀: [값...]})와
     주입 확률. 트렌드 값이 쓰인 질문은 seed_origin='trend'로 태깅된다.
@@ -466,16 +487,24 @@ def generate(
     # 과거 실행분을 중복 검사 기준에 미리 넣는다 — 세션을 거듭해도 준중복이 쌓이지 않게
     seen_exact: set[str] = {_normalize(q) for q in existing_questions or []}
     accepted_trigrams: list[set[str]] = [_trigrams(q) for q in existing_questions or []]
+    used_combos: set[str] = set(existing_combos or ())
     failures = 0
     batch = max(1, batch)
 
     while len(records) < count:
         n = min(batch, count - len(records)) if mode == "ollama" else 1
-        combos = [
-            sample_combo(domains[(len(records) + i) % len(domains)], taxonomy, pools, rng,
-                         trend_pools, trend_ratio)
-            for i in range(n)
-        ]
+        combos = []
+        for i in range(n):
+            domain_key = domains[(len(records) + i) % len(domains)]
+            # 이미 다룬 (인텐트, 엔티티) 조합은 피해서 뽑는다. 여러 번 시도해도
+            # 새 조합이 없으면(공간 소진) 반복을 허용 — 문구 중복은 문자열 검사가 차단.
+            for _ in range(12):
+                cand = sample_combo(domain_key, taxonomy, pools, rng,
+                                    trend_pools, trend_ratio)
+                if combo_key(cand["intent"], cand["slots"]) not in used_combos:
+                    break
+            used_combos.add(combo_key(cand["intent"], cand["slots"]))
+            combos.append(cand)
 
         if mode == "ollama":
             try:
@@ -531,6 +560,8 @@ def generate(
             })
             seen_exact.add(_normalize(question))
             accepted_trigrams.append(_trigrams(question))
+            if on_record:
+                on_record(records[-1])
             if on_progress:
                 on_progress(len(records), count)
 
@@ -571,17 +602,23 @@ def main() -> None:
     out_path = Path(args.out)
     if not out_path.is_absolute():
         out_path = BASE_DIR / out_path
-    # 출력 파일에 이미 쌓인 질문과 중복되지 않게 (append 운용 전제)
+    # 출력 파일에 이미 쌓인 질문·조합과 중복되지 않게 (append 운용 전제)
     existing: list[str] = []
+    existing_combos: set[str] = set()
     if out_path.exists():
         with open(out_path, encoding="utf-8") as f:
-            existing = [json.loads(line)["question"] for line in f if line.strip()]
+            for line in f:
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                existing.append(rec["question"])
+                existing_combos.add(combo_key(rec.get("intent", ""), rec.get("slots", {})))
         print(f"기존 {len(existing)}건과 중복 방지: {out_path}", file=sys.stderr)
 
     records = generate(
         count=args.count, domains=domains, mode=args.mode, model=args.model,
         host=args.host, temperature=args.temperature, seed=args.seed, batch=args.batch,
-        existing_questions=existing,
+        existing_questions=existing, existing_combos=existing_combos,
         on_progress=lambda d, t: print(f"\r생성 중... {d}/{t}", end="", file=sys.stderr),
     )
     print(file=sys.stderr)

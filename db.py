@@ -250,6 +250,14 @@ def all_question_texts() -> list[str]:
         return [r[0] for r in conn.execute("SELECT question FROM questions")]
 
 
+def all_question_combo_pairs() -> list[tuple[str, dict]]:
+    """지금까지 다룬 (인텐트, 슬롯) 쌍 전체 — 같은 조합을 문구만 바꿔 또 묻지 않도록
+    생성 시 회피 목록으로 쓴다."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT intent, slots_json FROM questions").fetchall()
+    return [(r["intent"], json.loads(r["slots_json"])) for r in rows]
+
+
 def reject_questions(ids: list[str]) -> int:
     """여러 질문을 한꺼번에 결함 제외. 기록은 남고 few-shot 예시에서 배제된다."""
     with get_conn() as conn:
