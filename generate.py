@@ -31,6 +31,11 @@ SEEDS_PATH = BASE_DIR / "seeds.yaml"
 DEFAULT_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "qwen3:4b"
 
+# localhost(Ollama) 호출 전용 세션. trust_env=False로 시스템 프록시/WPAD를 우회한다 —
+# 윈도우에서 프록시 설정이 있으면 localhost 요청조차 프록시를 타려다 수 초씩 지연될 수 있음.
+_session = requests.Session()
+_session.trust_env = False
+
 MIN_LEN, MAX_LEN = 6, 90        # 질문 길이 허용 범위(문자)
 DEDUP_JACCARD = 0.85            # 문자 trigram 유사도 임계값
 DEFAULT_BATCH = 8               # LLM 호출 1회당 생성 질문 수 (고정 프롬프트 prefill 비용을 N분의 1로)
@@ -215,7 +220,7 @@ def build_batch_prompt(combos: list[dict]) -> str:
 
 def check_ollama(host: str) -> bool:
     try:
-        r = requests.get(f"{host}/api/tags", timeout=2)
+        r = _session.get(f"{host}/api/tags", timeout=2)
         return r.status_code == 200
     except requests.RequestException:
         return False
@@ -243,7 +248,7 @@ def call_ollama_batch(combos: list[dict], host: str, model: str, temperature: fl
             "num_predict": 100 * len(combos) + 50,  # 출력 폭주 방지 상한
         },
     }
-    r = requests.post(f"{host}/api/chat", json=payload, timeout=600)
+    r = _session.post(f"{host}/api/chat", json=payload, timeout=600)
     r.raise_for_status()
     content = r.json().get("message", {}).get("content", "")
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
@@ -300,7 +305,7 @@ def extract_trend_candidates(text: str, pool_guide: dict[str, str],
         "keep_alive": KEEP_ALIVE,
         "options": {"temperature": 0.2, "num_predict": 800},
     }
-    r = requests.post(f"{host}/api/chat", json=payload, timeout=600)
+    r = _session.post(f"{host}/api/chat", json=payload, timeout=600)
     r.raise_for_status()
     content = r.json().get("message", {}).get("content", "")
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
@@ -429,6 +434,7 @@ def generate(
     trend_pools: dict[str, list[str]] | None = None,
     trend_ratio: float = 0.0,
     on_progress=None,
+    on_record=None,
 ) -> list[dict]:
     """질문 레코드 리스트를 반환. on_progress(done, total)로 진행 콜백 지원(UI용).
 
@@ -437,6 +443,9 @@ def generate(
 
     existing_questions: 과거 실행에서 이미 생성된 질문 텍스트 목록. 주어지면 이번
     실행분이 과거분과 완전/준중복되지 않도록 막는다 (실행 간 다양성 보장).
+
+    on_record: 질문 1건이 확정될 때마다 호출되는 콜백(레코드 1개). UI에서 즉시
+    저장용으로 쓰면 생성이 도중에 중단(rerun 등)되어도 그때까지의 결과가 보존된다.
 
     trend_pools/trend_ratio: 최신 기사·리뷰에서 추출한 트렌드 시드({풀: [값...]})와
     주입 확률. 트렌드 값이 쓰인 질문은 seed_origin='trend'로 태깅된다.
@@ -531,6 +540,8 @@ def generate(
             })
             seen_exact.add(_normalize(question))
             accepted_trigrams.append(_trigrams(question))
+            if on_record:
+                on_record(records[-1])
             if on_progress:
                 on_progress(len(records), count)
 

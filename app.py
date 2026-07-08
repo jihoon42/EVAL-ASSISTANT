@@ -9,6 +9,7 @@ app.py — E2E 검수 도우미 (Streamlit 로컬 앱)
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from datetime import date, datetime, timedelta
 from io import BytesIO
@@ -58,6 +59,28 @@ TREND_POOL_GUIDE = {
     "fin_product": "금융 상품 유형",
 }
 
+def _generation_worker(job: dict, params: dict) -> None:
+    """백그라운드 생성 스레드. Streamlit 호출 금지 — rerun과 무관하게 계속 돈다.
+    진행 상황은 job dict에 쓰고, 질문은 확정되는 즉시 DB에 저장한다."""
+
+    def on_record(rec: dict) -> None:
+        job["saved"] += db.insert_questions([rec])
+        job["mode"] = rec["gen_mode"]
+        if rec.get("seed_origin") == "trend":
+            job["trend"] += 1
+
+    def on_progress(done: int, total: int) -> None:
+        job["done"] = done
+
+    try:
+        gen.generate(**params, on_record=on_record, on_progress=on_progress)
+    except Exception as e:  # noqa: BLE001 — 스레드에서는 화면 대신 job에 기록
+        job["status"] = "error"
+        job["error"] = str(e)
+    else:
+        job["status"] = "done"
+
+
 # ---------------------------------------------------------------
 # 사이드바: 검수자 / 상태
 # ---------------------------------------------------------------
@@ -85,9 +108,52 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    ollama_ok = gen.check_ollama(gen.DEFAULT_HOST)
+
+    # rerun(모든 클릭)마다 네트워크 확인을 하면 환경에 따라 매번 수 초씩 걸릴 수 있어 캐시.
+    @st.cache_data(ttl=20, show_spinner=False)
+    def _ollama_status() -> bool:
+        return gen.check_ollama(gen.DEFAULT_HOST)
+
+    ollama_ok = _ollama_status()
     st.caption(f"Ollama: {'🟢 연결됨' if ollama_ok else '⚪ 미연결 (템플릿 모드 사용 가능)'}")
     st.caption("데이터는 이 PC의 data/ 폴더에만 저장됩니다.")
+
+    # ---- 백그라운드 생성 진행 패널 (어느 페이지에서든 보이도록 사이드바에) ----
+    _job = st.session_state.get("gen_job")
+    _thr = st.session_state.get("gen_thread")
+    _gen_running = (_job is not None and _job["status"] == "running"
+                    and _thr is not None and _thr.is_alive())
+
+    @st.fragment(run_every=2.0 if _gen_running else None)
+    def _gen_progress_panel() -> None:
+        j = st.session_state.get("gen_job")
+        if not j:
+            return
+        t = st.session_state.get("gen_thread")
+        alive = t is not None and t.is_alive()
+        if j["status"] == "running" and alive:
+            st.progress(min(j["done"] / max(j["total"], 1), 1.0),
+                        text=f"백그라운드 생성 {j['done']}/{j['total']} (저장 {j['saved']}건)")
+            st.caption("생성 중에도 페이지 이동·검수를 계속할 수 있습니다.")
+        else:
+            if j["status"] == "running" and not alive:
+                j["status"] = "stopped"  # 스레드가 비정상 종료된 경우
+            if j["status"] == "error":
+                st.error(f"생성 실패: {j['error']} — 그 전까지 {j['saved']}건은 저장됨")
+            elif j["status"] == "stopped":
+                st.warning(f"생성이 중단되었습니다 — {j['saved']}건은 저장됨")
+            else:
+                st.success(f"생성 완료: {j['saved']}건 저장"
+                           + (f" (트렌드 {j['trend']}건)" if j["trend"] else ""))
+            if st.button("알림 지우기", key="gen_job_dismiss"):
+                st.session_state.pop("gen_job", None)
+                st.session_state.pop("gen_thread", None)
+                st.rerun()
+            if _gen_running:
+                st.rerun()  # 완료 전환 시 1회 전체 rerun으로 2초 폴링 종료
+
+    st.divider()
+    _gen_progress_panel()
 
 # st.tabs는 위젯 변경 rerun 시 활성 탭이 첫 탭으로 튕기는 문제가 있어(예: ② 탭에서
 # 검수할 질문을 고르면 ① 화면으로 이동) 세션 상태에 고정되는 페이지 방식을 쓴다.
@@ -142,38 +208,27 @@ if page == "① 질문 생성":
              f"현재 유효한 트렌드 시드 {n_trend}개"
              + ("" if n_trend else " — ④ 탭에서 먼저 등록하세요."))
 
-    if st.button("생성 시작", type="primary", disabled=not picked):
-        progress = st.progress(0.0, text="생성 중...")
+    gen_thread = st.session_state.get("gen_thread")
+    gen_running = gen_thread is not None and gen_thread.is_alive()
 
-        def on_progress(done: int, total_: int) -> None:
-            progress.progress(done / total_, text=f"생성 중... {done}/{total_}")
-
-        try:
-            exemplars = db.exemplar_records(6)
-            if exemplars:
-                st.caption(f"검수 통과 질문 {len(exemplars)}건을 few-shot 예시로 사용합니다 (도메인 안배).")
-            records = gen.generate(
-                count=int(count), domains=picked, mode=mode, model=model,
-                batch=int(batch), exemplars=exemplars,
-                existing_questions=db.all_question_texts(),  # 과거 생성분과 준중복 방지
-                trend_pools=trend_pools, trend_ratio=float(trend_ratio),
-                on_progress=on_progress,
-            )
-            inserted = db.insert_questions(records)
-            progress.progress(1.0, text="완료")
-            n_trend_q = sum(1 for r in records if r.get("seed_origin") == "trend")
-            st.success(f"{inserted}건 생성·저장 완료 (모드: {records[0]['gen_mode'] if records else mode}"
-                       + (f", 트렌드 시드 질문 {n_trend_q}건" if n_trend_q else "") + ")")
-            st.dataframe(
-                pd.DataFrame(
-                    [{"도메인": r["domain_name"], "인텐트": r["intent_name"],
-                      "질문": r["question"], "생성모드": r["gen_mode"],
-                      "시드출처": r.get("seed_origin", "base")} for r in records]
-                ),
-                width="stretch", hide_index=True,
-            )
-        except Exception as e:  # noqa: BLE001
-            st.error(f"생성 실패: {e}")
+    st.caption("생성은 백그라운드에서 진행됩니다 — 페이지를 이동하거나 검수를 계속해도 끊기지 "
+               "않고, 질문은 만들어지는 즉시 저장됩니다. 진행률은 사이드바에 표시되고, "
+               "새 질문은 아래 '질문 정리'와 ② 대기열에서 바로 확인할 수 있습니다.")
+    if st.button("생성 시작" if not gen_running else "생성 진행 중...",
+                 type="primary", disabled=not picked or gen_running):
+        job = {"total": int(count), "done": 0, "saved": 0, "trend": 0,
+               "status": "running", "error": None, "mode": None}
+        params = dict(
+            count=int(count), domains=picked, mode=mode, model=model,
+            batch=int(batch), exemplars=db.exemplar_records(6),
+            existing_questions=db.all_question_texts(),  # 과거 생성분과 준중복 방지
+            trend_pools=trend_pools, trend_ratio=float(trend_ratio),
+        )
+        worker = threading.Thread(target=_generation_worker, args=(job, params), daemon=True)
+        st.session_state["gen_job"] = job
+        st.session_state["gen_thread"] = worker
+        worker.start()
+        st.rerun()
 
     st.divider()
     st.subheader("질문 정리 — 검수 전에 걸러내기")
