@@ -6,6 +6,7 @@
 *.jsonl
 *.txt
 !requirements.txt
+!requirements-dev.txt
 
 # 로컬 데이터
 data/

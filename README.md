@@ -163,6 +163,18 @@ CPU 추론에서 병목은 토큰 생성이 아니라 **호출마다 반복되�
 | `app.py` | Streamlit 검수 도우미 (생성/검수/집계·xlsx) |
 | `.streamlit/config.toml` | 텔레메트리 차단, localhost 바인딩 등 팀 공통 설정 |
 | `setup.bat` / `run.bat` | 윈도우 동료 PC용 — 1회 설치 / 더블클릭 실행(브라우저 자동 오픈) |
+| `tests/` | pytest 회귀 테스트 (실사용 data/와 격리된 임시 DB 사용) |
+
+## 테스트
+
+```bash
+pip install -r requirements-dev.txt   # pytest — 동료 PC에는 불필요
+python -m pytest tests/ -q
+```
+
+모든 테스트는 테스트별 임시 DB로 자동 격리되어 실사용 `data/`를 절대 건드리지 않습니다.
+Ollama가 필요한 테스트(트렌드 시드 추출)는 미연결 시 자동 스킵됩니다.
+기능을 고쳤다면 커밋 전에 이 한 줄로 회귀 여부를 확인하세요.
 
 ## 품질 관리 체계
 

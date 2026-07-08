@@ -1,0 +1,3 @@
+# 개발·테스트 전용 의존성 (동료 PC 설치에는 불필요)
+-r requirements.txt
+pytest>=8.0
