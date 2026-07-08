@@ -96,6 +96,36 @@ def test_pick_question_stays_on_page2():
     assert "부산 모레 눈 온대?" in [c.value for c in at.code]
 
 
+def test_submit_view_deduplicates_same_name_columns():
+    """기본 제출양식: '기획 검수' 2개가 보이지 않는 공백으로 구분되어 표시되고,
+    같은 렌더에서 xlsx(원래 이름 그대로 중복 헤더)까지 예외 없이 빌드된다."""
+    seed_minimal()
+    at = make_app("③ 결과·내보내기")
+    at.run()
+    assert not at.exception, at.exception
+    subs = [d.value for d in at.dataframe
+            if "검색 키워드" in d.value.columns and "기획 검수" in d.value.columns]
+    assert subs, "제출양식 뷰를 찾지 못함"
+    cols = list(subs[0].columns)
+    assert cols.count("기획 검수") == 1 and "기획 검수 " in cols
+
+
+def test_submit_layout_editor_removes_and_adds_columns():
+    """컬럼 구성 편집: 줄 삭제 = 컬럼 제거, 데이터에 없는 이름(비고) = 빈 컬럼,
+    '날짜' 대신 '검수일시' 같은 데이터 컬럼 치환."""
+    seed_minimal()
+    at = make_app("③ 결과·내보내기")
+    at.session_state["submit_layout"] = "\n".join(["검수일시", "테스터", "검색 키워드", "비고"])
+    at.run()
+    assert not at.exception, at.exception
+    target = [d.value for d in at.dataframe
+              if list(d.value.columns) == ["검수일시", "테스터", "검색 키워드", "비고"]]
+    assert target, [list(d.value.columns) for d in at.dataframe]
+    view = target[0]
+    assert (view["비고"] == "").all()
+    assert view.iloc[0]["검색 키워드"] == "강릉 주말 기온 어때?"
+
+
 def test_background_generation_e2e_and_lock():
     at = make_app()
     at.run()

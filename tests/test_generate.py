@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import random
+import threading
 
 import pytest
 
@@ -173,6 +174,44 @@ def test_on_record_preserves_progress_on_abort():
                  on_record=lambda r: db.insert_questions([r]))
     texts = db.all_question_texts()
     assert len(texts) == 10 and len(set(texts)) == 10
+
+
+# ---------------------------------------------------------------
+# 동시성: 백그라운드 생성(스레드 저장)과 메인 스레드 검수가 같은 DB를 공유
+# ---------------------------------------------------------------
+
+def test_concurrent_generation_and_review():
+    errors: list[str] = []
+
+    def worker() -> None:
+        try:
+            gen.generate(count=120, domains=["weather", "local", "finance"],
+                         mode="template", seed=11,
+                         on_record=lambda r: db.insert_questions([r]))
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"worker: {e}")
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    reviewed = 0
+    while t.is_alive():
+        try:
+            db.status_counts()
+            db.pending_queue()
+            db.curation_df()
+            row = db.next_pending()
+            if row and reviewed < 5:
+                db.save_review(row["id"], "응답", "pass", "", "", "pass", "", "",
+                               f"s{reviewed}", "t", "cbt")
+                reviewed += 1
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"main: {e}")
+            break
+    t.join(30)
+    assert not errors, errors
+    counts = db.status_counts()
+    assert counts["pending"] + counts["done"] == 120, counts  # 유실 없음
+    assert counts["done"] == reviewed, counts                 # 동시 검수 저장 정합
 
 
 # ---------------------------------------------------------------
