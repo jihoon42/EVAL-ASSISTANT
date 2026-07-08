@@ -248,6 +248,8 @@ if page == "① 질문 생성":
                     count=int(count), domains=picked, mode=mode, model=model,
                     batch=int(batch), exemplars=db.exemplar_records(6),
                     existing_questions=db.all_question_texts(),  # 과거 생성분과 준중복 방지
+                    existing_combos={gen.combo_key(i, s)  # 같은 (인텐트, 엔티티) 반복 회피
+                                     for i, s in db.all_question_combo_pairs()},
                     trend_pools=trend_pools, trend_ratio=float(trend_ratio),
                 )
                 worker = threading.Thread(target=_generation_worker,

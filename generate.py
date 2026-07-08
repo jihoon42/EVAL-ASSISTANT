@@ -85,6 +85,12 @@ def load_taxonomy() -> dict:
 # 슬롯 조합 샘플링
 # ---------------------------------------------------------------
 
+def combo_key(intent: str, slots: dict[str, str]) -> str:
+    """(인텐트, 엔티티 값들)로 만든 조합 식별자.
+    문자 유사도 검사는 조사 하나만 달라도 통과시키므로(짧은 문장에서 trigram 급락),
+    '같은 것을 또 묻는' 중복은 문구가 아니라 이 조합 단위로 회피한다."""
+    return intent + "|" + "|".join(sorted(slots.values()))
+
 def sample_combo(domain_key: str, taxonomy: dict, pools: dict, rng: random.Random,
                  trend_pools: dict[str, list[str]] | None = None,
                  trend_ratio: float = 0.0) -> dict:
@@ -433,6 +439,7 @@ def generate(
     existing_questions: list[str] | None = None,
     trend_pools: dict[str, list[str]] | None = None,
     trend_ratio: float = 0.0,
+    existing_combos: set[str] | None = None,
     on_progress=None,
     on_record=None,
 ) -> list[dict]:
@@ -442,7 +449,12 @@ def generate(
     사용(검수)이 쌓일수록 생성 품질이 따라 올라간다. 없으면 기본 예시 사용.
 
     existing_questions: 과거 실행에서 이미 생성된 질문 텍스트 목록. 주어지면 이번
-    실행분이 과거분과 완전/준중복되지 않도록 막는다 (실행 간 다양성 보장).
+    실행분이 과거분과 완전/준중복(문자 기준)되지 않도록 막는다. 단, 문자 검사는
+    거의 동일한 문구만 잡으므로 '같은 주제 반복'은 existing_combos가 담당한다.
+
+    existing_combos: 이미 다룬 (인텐트, 엔티티) 조합 키 집합 (combo_key() 형식).
+    이번 실행 내 중복 포함, 이미 나온 조합은 피해서 샘플링한다 — 예: '주택청약
+    1순위 조건'을 문구만 바꿔 또 묻는 것 방지. 조합 공간이 소진되면 반복 허용.
 
     on_record: 질문 1건이 확정될 때마다 호출되는 콜백(레코드 1개). UI에서 즉시
     저장용으로 쓰면 생성이 도중에 중단(rerun 등)되어도 그때까지의 결과가 보존된다.
@@ -475,16 +487,24 @@ def generate(
     # 과거 실행분을 중복 검사 기준에 미리 넣는다 — 세션을 거듭해도 준중복이 쌓이지 않게
     seen_exact: set[str] = {_normalize(q) for q in existing_questions or []}
     accepted_trigrams: list[set[str]] = [_trigrams(q) for q in existing_questions or []]
+    used_combos: set[str] = set(existing_combos or ())
     failures = 0
     batch = max(1, batch)
 
     while len(records) < count:
         n = min(batch, count - len(records)) if mode == "ollama" else 1
-        combos = [
-            sample_combo(domains[(len(records) + i) % len(domains)], taxonomy, pools, rng,
-                         trend_pools, trend_ratio)
-            for i in range(n)
-        ]
+        combos = []
+        for i in range(n):
+            domain_key = domains[(len(records) + i) % len(domains)]
+            # 이미 다룬 (인텐트, 엔티티) 조합은 피해서 뽑는다. 여러 번 시도해도
+            # 새 조합이 없으면(공간 소진) 반복을 허용 — 문구 중복은 문자열 검사가 차단.
+            for _ in range(12):
+                cand = sample_combo(domain_key, taxonomy, pools, rng,
+                                    trend_pools, trend_ratio)
+                if combo_key(cand["intent"], cand["slots"]) not in used_combos:
+                    break
+            used_combos.add(combo_key(cand["intent"], cand["slots"]))
+            combos.append(cand)
 
         if mode == "ollama":
             try:
@@ -582,17 +602,23 @@ def main() -> None:
     out_path = Path(args.out)
     if not out_path.is_absolute():
         out_path = BASE_DIR / out_path
-    # 출력 파일에 이미 쌓인 질문과 중복되지 않게 (append 운용 전제)
+    # 출력 파일에 이미 쌓인 질문·조합과 중복되지 않게 (append 운용 전제)
     existing: list[str] = []
+    existing_combos: set[str] = set()
     if out_path.exists():
         with open(out_path, encoding="utf-8") as f:
-            existing = [json.loads(line)["question"] for line in f if line.strip()]
+            for line in f:
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                existing.append(rec["question"])
+                existing_combos.add(combo_key(rec.get("intent", ""), rec.get("slots", {})))
         print(f"기존 {len(existing)}건과 중복 방지: {out_path}", file=sys.stderr)
 
     records = generate(
         count=args.count, domains=domains, mode=args.mode, model=args.model,
         host=args.host, temperature=args.temperature, seed=args.seed, batch=args.batch,
-        existing_questions=existing,
+        existing_questions=existing, existing_combos=existing_combos,
         on_progress=lambda d, t: print(f"\r생성 중... {d}/{t}", end="", file=sys.stderr),
     )
     print(file=sys.stderr)
