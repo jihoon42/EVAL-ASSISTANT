@@ -1,13 +1,15 @@
-"""app.py 흐름 검증 (AppTest): 페이지 렌더링·내비 복원·검수 흐름·백그라운드 생성.
+"""app.py 흐름 검증 (AppTest): 페이지 렌더링·내비 복원·검수 흐름·백그라운드 LLM 작업.
 conftest의 autouse 임시 DB 덕에 실사용 data/에는 절대 손대지 않는다."""
 from __future__ import annotations
 
 import time
 from datetime import date, timedelta
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
 import db
+import generate as gen
 from helpers import APP_PATH, question
 
 PAGES = ["① 질문 생성", "② 검수 진행", "③ 결과·내보내기", "④ 트렌드 시드"]
@@ -162,4 +164,39 @@ def test_generation_button_locked_while_running():
                                    "status": "running", "error": None, "mode": "template"}
     at.run()
     assert not at.exception, at.exception
-    assert any("생성 진행 중" in str(b.label) for b in at.button)
+    assert any("LLM 작업 진행 중" in str(b.label) for b in at.button)
+
+
+def test_extraction_thread_crash_guard():
+    """추출 스레드가 비정상 종료돼도 ④가 에러를 표시하고 상태를 정리한다."""
+    at = make_app("④ 트렌드 시드")
+    at.session_state["ext_job"] = {"status": "running", "cands": None, "error": None}
+    at.session_state["ext_thread"] = None
+    at.run()
+    assert not at.exception, at.exception
+    assert any("추출 실패" in str(e.value) for e in at.error)
+    assert "ext_job" not in at.session_state
+
+
+@pytest.mark.skipif(not gen.check_ollama(gen.DEFAULT_HOST), reason="Ollama 미연결")
+def test_background_extraction_e2e():
+    """추출 백그라운드 실행: 시작 → 스레드 완료 → 후보 인계 → 잠금 해제(버튼 복구)."""
+    at = make_app("④ 트렌드 시드")
+    at.session_state["trend_raw"] = ("성수동 베이커리마다 두쫀쿠를 사려는 줄이 이어졌고, "
+                                     "연남동에서는 버터떡 가게가 늘고 있다.")
+    at.run()
+    [b for b in at.button if "후보 추출" in str(b.label)][0].click().run()
+    assert not at.exception, at.exception
+
+    job = at.session_state["ext_job"]
+    for _ in range(600):  # 최대 5분 (CPU 추론 감안)
+        if job["status"] != "running":
+            break
+        time.sleep(0.5)
+    assert job["status"] == "done", job
+
+    at.run()  # 완료 인계: 후보가 검토 단계로 넘어가고 잡 상태는 정리됨
+    assert not at.exception, at.exception
+    assert "ext_job" not in at.session_state
+    assert "trend_cands" in at.session_state
+    assert any(str(b.label) == "후보 추출" for b in at.button), "잠금이 해제되지 않음"

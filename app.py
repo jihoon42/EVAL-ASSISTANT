@@ -15,7 +15,6 @@ from datetime import date, datetime, timedelta
 from io import BytesIO
 
 import pandas as pd
-import requests
 import streamlit as st
 
 import db
@@ -60,10 +59,12 @@ TREND_POOL_GUIDE = {
 }
 
 @st.cache_resource
-def _generation_lock() -> threading.Lock:
-    """서버 전역 생성 잠금. 앱 스크립트는 rerun마다 재실행되므로 모듈 변수는 리셋된다 —
-    cache_resource로 서버 수명 동안 하나만 유지해, 서로 다른 브라우저 세션(탭)이
-    동시에 생성을 걸어 준중복이 생기는 것을 막는다."""
+def _llm_lock() -> threading.Lock:
+    """서버 전역 LLM 작업 잠금 (생성·추출 공용). 앱 스크립트는 rerun마다 재실행되므로
+    모듈 변수는 리셋된다 — cache_resource로 서버 수명 동안 하나만 유지한다.
+    로컬 Ollama는 CPU 하나를 쓰는 순차 처리라, 생성과 추출이 동시에 돌면 서로의
+    요청 뒤에 줄을 서며 둘 다 몇 배로 느려진다 → 상호 배제로 순차를 강제한다.
+    (서로 다른 브라우저 탭의 동시 생성으로 인한 준중복 방지도 겸한다)"""
     return threading.Lock()
 
 
@@ -83,6 +84,21 @@ def _generation_worker(job: dict, params: dict, lock: threading.Lock) -> None:
     try:
         gen.generate(**params, on_record=on_record, on_progress=on_progress)
     except Exception as e:  # noqa: BLE001 — 스레드에서는 화면 대신 job에 기록
+        job["status"] = "error"
+        job["error"] = str(e)
+    else:
+        job["status"] = "done"
+    finally:
+        lock.release()
+
+
+def _extraction_worker(job: dict, text: str, lock: threading.Lock) -> None:
+    """백그라운드 트렌드 시드 추출 스레드. CPU에서 분 단위로 걸릴 수 있는 작업이라
+    화면 스레드에서 떼어낸다 — 추출 중에도 페이지 이동·검수가 가능해진다."""
+    try:
+        cands = gen.extract_trend_candidates(text, TREND_POOL_GUIDE)
+        job["cands"] = [{**c, "verbatim": c["value"] in text} for c in cands]
+    except Exception as e:  # noqa: BLE001
         job["status"] = "error"
         job["error"] = str(e)
     else:
@@ -155,42 +171,59 @@ with st.sidebar:
     # 접속했을 때 즉시 알아챌 수 있다.
     st.caption(f"데이터 위치: `{db.DB_PATH}`")
 
-    # ---- 백그라운드 생성 진행 패널 (어느 페이지에서든 보이도록 사이드바에) ----
-    _job = st.session_state.get("gen_job")
-    _thr = st.session_state.get("gen_thread")
-    _gen_running = (_job is not None and _job["status"] == "running"
-                    and _thr is not None and _thr.is_alive())
+    # ---- 백그라운드 LLM 작업(생성·추출) 진행 패널 — 어느 페이지에서든 보이도록 사이드바에 ----
+    def _running(job_key: str, thread_key: str) -> bool:
+        j = st.session_state.get(job_key)
+        t = st.session_state.get(thread_key)
+        return (j is not None and j["status"] == "running"
+                and t is not None and t.is_alive())
 
-    @st.fragment(run_every=2.0 if _gen_running else None)
-    def _gen_progress_panel() -> None:
+    _gen_running = _running("gen_job", "gen_thread")
+    _ext_running = _running("ext_job", "ext_thread")
+
+    @st.fragment(run_every=2.0 if (_gen_running or _ext_running) else None)
+    def _llm_progress_panel() -> None:
         j = st.session_state.get("gen_job")
-        if not j:
-            return
-        t = st.session_state.get("gen_thread")
-        alive = t is not None and t.is_alive()
-        if j["status"] == "running" and alive:
-            st.progress(min(j["done"] / max(j["total"], 1), 1.0),
-                        text=f"백그라운드 생성 {j['done']}/{j['total']} (저장 {j['saved']}건)")
-            st.caption("생성 중에도 페이지 이동·검수를 계속할 수 있습니다.")
-        else:
-            if j["status"] == "running" and not alive:
-                j["status"] = "stopped"  # 스레드가 비정상 종료된 경우
-            if j["status"] == "error":
-                st.error(f"생성 실패: {j['error']} — 그 전까지 {j['saved']}건은 저장됨")
-            elif j["status"] == "stopped":
-                st.warning(f"생성이 중단되었습니다 — {j['saved']}건은 저장됨")
+        if j is not None:
+            t = st.session_state.get("gen_thread")
+            alive = t is not None and t.is_alive()
+            if j["status"] == "running" and alive:
+                st.progress(min(j["done"] / max(j["total"], 1), 1.0),
+                            text=f"백그라운드 생성 {j['done']}/{j['total']} (저장 {j['saved']}건)")
+                st.caption("생성 중에도 페이지 이동·검수를 계속할 수 있습니다.")
             else:
-                st.success(f"생성 완료: {j['saved']}건 저장"
-                           + (f" (트렌드 {j['trend']}건)" if j["trend"] else ""))
-            if st.button("알림 지우기", key="gen_job_dismiss"):
-                st.session_state.pop("gen_job", None)
-                st.session_state.pop("gen_thread", None)
-                st.rerun()
-            if _gen_running:
-                st.rerun()  # 완료 전환 시 1회 전체 rerun으로 2초 폴링 종료
+                if j["status"] == "running" and not alive:
+                    j["status"] = "stopped"  # 스레드가 비정상 종료된 경우
+                if j["status"] == "error":
+                    st.error(f"생성 실패: {j['error']} — 그 전까지 {j['saved']}건은 저장됨")
+                elif j["status"] == "stopped":
+                    st.warning(f"생성이 중단되었습니다 — {j['saved']}건은 저장됨")
+                else:
+                    st.success(f"생성 완료: {j['saved']}건 저장"
+                               + (f" (트렌드 {j['trend']}건)" if j["trend"] else ""))
+                if st.button("알림 지우기", key="gen_job_dismiss"):
+                    st.session_state.pop("gen_job", None)
+                    st.session_state.pop("gen_thread", None)
+                    st.rerun()
+
+        ej = st.session_state.get("ext_job")
+        if ej is not None:
+            et = st.session_state.get("ext_thread")
+            ealive = et is not None and et.is_alive()
+            if ej["status"] == "running" and ealive:
+                st.caption("🔎 트렌드 시드 후보 추출 중... 완료되면 ④ 탭에 표시됩니다. "
+                           "(CPU에서는 몇 분 걸릴 수 있음)")
+            elif ej["status"] == "done":
+                st.caption(f"✅ 추출 완료 — 후보 {len(ej['cands'] or [])}건. ④ 탭에서 검토하세요.")
+            else:
+                st.caption("⚠️ 추출이 끝나지 못했습니다. ④ 탭에서 상태를 확인하세요.")
+
+        if (_gen_running or _ext_running) and not (
+                _running("gen_job", "gen_thread") or _running("ext_job", "ext_thread")):
+            st.rerun()  # 완료 전환 시 1회 전체 rerun으로 2초 폴링 종료
 
     st.divider()
-    _gen_progress_panel()
+    _llm_progress_panel()
 
 # ---------------------------------------------------------------
 # ① 질문 생성
@@ -230,16 +263,17 @@ if page == "① 질문 생성":
 
     gen_thread = st.session_state.get("gen_thread")
     gen_running = ((gen_thread is not None and gen_thread.is_alive())
-                   or _generation_lock().locked())  # 다른 세션(탭)의 생성도 포함
+                   or _llm_lock().locked())  # 추출·다른 세션(탭)의 LLM 작업도 포함
 
     st.caption("생성은 백그라운드에서 진행됩니다 — 페이지를 이동하거나 검수를 계속해도 끊기지 "
                "않고, 질문은 만들어지는 즉시 저장됩니다. 진행률은 사이드바에 표시되고, "
-               "새 질문은 아래 '질문 정리'와 ② 대기열에서 바로 확인할 수 있습니다.")
-    if st.button("생성 시작" if not gen_running else "생성 진행 중...",
+               "새 질문은 아래 '질문 정리'와 ② 대기열에서 바로 확인할 수 있습니다. "
+               "생성과 ④ 시드 추출은 같은 로컬 LLM을 쓰므로 한 번에 하나만 실행됩니다.")
+    if st.button("생성 시작" if not gen_running else "LLM 작업 진행 중...",
                  type="primary", disabled=not picked or gen_running):
-        lock = _generation_lock()
+        lock = _llm_lock()
         if not lock.acquire(blocking=False):
-            st.warning("다른 세션(브라우저 탭)에서 생성이 진행 중입니다. 끝난 뒤 다시 시도하세요.")
+            st.warning("다른 LLM 작업(생성 또는 ④ 추출)이 진행 중입니다. 끝난 뒤 다시 시도하세요.")
         else:
             try:
                 job = {"total": int(count), "done": 0, "saved": 0, "trend": 0,
@@ -751,6 +785,11 @@ if page == "④ 트렌드 시드":
     trend_src = st.text_input("출처 메모 (기사 제목·URL 등)", key="trend_src")
     trend_raw = st.text_area("기사/리뷰 본문 붙여넣기", height=180, key="trend_raw",
                              placeholder="본문을 통째로 붙여넣어도 됩니다. 광고 문구는 추출·검토 단계에서 걸러집니다.")
+    ext_thread = st.session_state.get("ext_thread")
+    ext_job = st.session_state.get("ext_job")
+    ext_running = ext_thread is not None and ext_thread.is_alive()
+    llm_busy = _llm_lock().locked()
+
     tc1, tc2 = st.columns([1, 3])
     with tc1:
         trend_days = st.number_input("유효기간(일)", min_value=1, max_value=365, value=14,
@@ -758,22 +797,49 @@ if page == "④ 트렌드 시드":
     with tc2:
         st.write("")
         st.write("")
-        extract_clicked = st.button("후보 추출", type="primary",
-                                    disabled=not trend_raw.strip() or not ollama_ok)
+        extract_clicked = st.button(
+            "후보 추출" if not llm_busy else "LLM 작업 진행 중...",
+            type="primary", disabled=not trend_raw.strip() or not ollama_ok or llm_busy,
+            help="추출은 백그라운드로 진행됩니다 — 기다리는 동안 다른 페이지에서 검수를 "
+                 "계속할 수 있습니다. ① 생성과 같은 LLM을 쓰므로 한 번에 하나만 실행됩니다.")
     if not ollama_ok:
         st.info("Ollama 미연결 — 자동 추출은 불가하지만 아래 '직접 등록'은 사용할 수 있습니다.")
 
     if extract_clicked:
-        with st.spinner("본문에서 후보 추출 중..."):
+        lock = _llm_lock()
+        if not lock.acquire(blocking=False):
+            st.warning("다른 LLM 작업(① 생성 등)이 진행 중입니다. 끝난 뒤 다시 시도하세요.")
+        else:
             try:
-                cands = gen.extract_trend_candidates(trend_raw, TREND_POOL_GUIDE)
-                # 본문에 그대로 등장하는지 표시 (환각 방지 확인용)
-                st.session_state["trend_cands"] = [
-                    {**c, "verbatim": c["value"] in trend_raw} for c in cands]
-                if not cands:
+                job = {"status": "running", "cands": None, "error": None}
+                worker = threading.Thread(target=_extraction_worker,
+                                          args=(job, trend_raw, lock), daemon=True)
+                st.session_state["ext_job"] = job
+                st.session_state["ext_thread"] = worker
+                st.session_state.pop("trend_cands", None)  # 이전 추출 결과 비우기
+                worker.start()  # 이후 잠금 해제는 워커의 finally가 담당
+            except BaseException:
+                lock.release()
+                raise
+            st.rerun()
+
+    # 백그라운드 추출이 끝났으면 결과를 후보 검토 단계로 인계
+    if ext_job is not None:
+        if ext_job["status"] == "running" and not ext_running:
+            ext_job["status"] = "error"
+            ext_job["error"] = "추출 스레드가 비정상 종료되었습니다. 다시 시도하세요."
+        if ext_job["status"] == "running":
+            st.caption("🔎 추출 진행 중... 완료되면 여기에 후보가 표시됩니다 "
+                       "(사이드바에서도 상태를 볼 수 있습니다).")
+        else:
+            if ext_job["status"] == "done":
+                st.session_state["trend_cands"] = ext_job["cands"]
+                if not ext_job["cands"]:
                     st.warning("후보를 찾지 못했습니다. 본문을 더 넣거나 직접 등록해 보세요.")
-            except requests.RequestException as e:
-                st.error(f"추출 실패: {e}")
+            else:
+                st.error(f"추출 실패: {ext_job['error']}")
+            st.session_state.pop("ext_job", None)
+            st.session_state.pop("ext_thread", None)
 
     cands = st.session_state.get("trend_cands")
     if cands:

@@ -311,7 +311,8 @@ def extract_trend_candidates(text: str, pool_guide: dict[str, str],
         "keep_alive": KEEP_ALIVE,
         "options": {"temperature": 0.2, "num_predict": 800},
     }
-    r = _session.post(f"{host}/api/chat", json=payload, timeout=600)
+    # 추출은 LLM 잠금을 쥔 채 돌므로, 호출이 잘못돼도 잠금 점유가 5분을 넘지 않게 상한
+    r = _session.post(f"{host}/api/chat", json=payload, timeout=300)
     r.raise_for_status()
     content = r.json().get("message", {}).get("content", "")
     content = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
