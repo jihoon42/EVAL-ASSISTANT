@@ -1,4 +1,7 @@
-streamlit>=1.50
+# streamlit은 검증된 버전으로 고정 — 테스트 스위트(tests/) 29개가 이 버전 기준.
+# 올릴 때는 핀 변경 → pytest 통과 확인 → 커밋 순서로. (하한만 두면 설치 날짜에
+# 따라 버전이 갈려 개발 PC와 동료 PC의 동작이 달라진다 — 2026-07-08 retro 참고)
+streamlit==1.58.0
 pandas>=2.0
 openpyxl>=3.1
 pyyaml>=6.0
