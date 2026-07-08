@@ -59,7 +59,15 @@ TREND_POOL_GUIDE = {
     "fin_product": "금융 상품 유형",
 }
 
-def _generation_worker(job: dict, params: dict) -> None:
+@st.cache_resource
+def _generation_lock() -> threading.Lock:
+    """서버 전역 생성 잠금. 앱 스크립트는 rerun마다 재실행되므로 모듈 변수는 리셋된다 —
+    cache_resource로 서버 수명 동안 하나만 유지해, 서로 다른 브라우저 세션(탭)이
+    동시에 생성을 걸어 준중복이 생기는 것을 막는다."""
+    return threading.Lock()
+
+
+def _generation_worker(job: dict, params: dict, lock: threading.Lock) -> None:
     """백그라운드 생성 스레드. Streamlit 호출 금지 — rerun과 무관하게 계속 돈다.
     진행 상황은 job dict에 쓰고, 질문은 확정되는 즉시 DB에 저장한다."""
 
@@ -79,7 +87,34 @@ def _generation_worker(job: dict, params: dict) -> None:
         job["error"] = str(e)
     else:
         job["status"] = "done"
+    finally:
+        lock.release()
 
+
+# ---------------------------------------------------------------
+# 페이지 내비게이션 — 반드시 첫 위젯으로 그린다.
+# st.tabs는 위젯 변경 rerun 시 활성 탭이 첫 탭으로 튕기는 문제가 있어(예: ② 탭에서
+# 검수할 질문을 고르면 ① 화면으로 이동) 세션 상태에 고정되는 페이지 방식을 쓴다.
+# 실행이 도중에 중단(연타·이른 st.rerun)되면 아직 안 그려진 위젯 상태가 정리될 수 있어
+# ① 첫 위젯으로 배치하고 ② 위젯 정리 대상이 아닌 nav_last로 유실 시 자동 복원한다.
+# ---------------------------------------------------------------
+PAGES = ["① 질문 생성", "② 검수 진행", "③ 결과·내보내기", "④ 트렌드 시드"]
+if "nav" not in st.session_state:  # 최초 실행 또는 위젯 상태 유실 → 마지막 페이지 복원
+    st.session_state["nav"] = st.session_state.get("nav_last", PAGES[0])
+# segmented_control은 rerun 뒤 값과 하이라이트가 어긋나는 사례가 있어(내용은 ①인데
+# 불은 ②) 검증이 오래된 radio를 쓴다. 값-표시 동기화가 엄격해 어긋날 수 없다.
+page = st.radio("페이지 이동", PAGES, key="nav", horizontal=True,
+                label_visibility="collapsed")
+st.session_state["nav_last"] = page
+
+# 페이지를 오가도 작성 중이던 입력이 날아가지 않도록 위젯 상태를 고정한다.
+# (렌더링되지 않은 위젯의 상태는 Streamlit이 정리해 버리므로 재대입으로 보존 표시)
+_PRESERVE_KEYS = ("rv_response", "rv_search", "rv_acc_comment", "rv_out_comment",
+                  "rv_fail", "rv_err", "mq_text", "mq_entities", "submit_layout",
+                  "trend_src", "trend_raw", "trend_val")
+for _k in _PRESERVE_KEYS:
+    if _k in st.session_state:
+        st.session_state[_k] = st.session_state[_k]
 
 # ---------------------------------------------------------------
 # 사이드바: 검수자 / 상태
@@ -116,7 +151,9 @@ with st.sidebar:
 
     ollama_ok = _ollama_status()
     st.caption(f"Ollama: {'🟢 연결됨' if ollama_ok else '⚪ 미연결 (템플릿 모드 사용 가능)'}")
-    st.caption("데이터는 이 PC의 data/ 폴더에만 저장됩니다.")
+    # 데이터 경로를 노출해 두면 같은 포트를 점유한 다른 인스턴스(WSL vs 윈도우)에
+    # 접속했을 때 즉시 알아챌 수 있다.
+    st.caption(f"데이터 위치: `{db.DB_PATH}`")
 
     # ---- 백그라운드 생성 진행 패널 (어느 페이지에서든 보이도록 사이드바에) ----
     _job = st.session_state.get("gen_job")
@@ -155,23 +192,6 @@ with st.sidebar:
     st.divider()
     _gen_progress_panel()
 
-# st.tabs는 위젯 변경 rerun 시 활성 탭이 첫 탭으로 튕기는 문제가 있어(예: ② 탭에서
-# 검수할 질문을 고르면 ① 화면으로 이동) 세션 상태에 고정되는 페이지 방식을 쓴다.
-PAGES = ["① 질문 생성", "② 검수 진행", "③ 결과·내보내기", "④ 트렌드 시드"]
-_pick = st.segmented_control("페이지 이동", PAGES, key="nav", default=PAGES[0],
-                             label_visibility="collapsed")
-page = _pick or st.session_state.get("nav_last", PAGES[0])  # 재클릭 해제 시 현재 페이지 유지
-st.session_state["nav_last"] = page
-
-# 페이지를 오가도 작성 중이던 입력이 날아가지 않도록 위젯 상태를 고정한다.
-# (렌더링되지 않은 위젯의 상태는 Streamlit이 정리해 버리므로 재대입으로 보존 표시)
-_PRESERVE_KEYS = ("rv_response", "rv_search", "rv_acc_comment", "rv_out_comment",
-                  "rv_fail", "rv_err", "mq_text", "mq_entities", "submit_layout",
-                  "trend_src", "trend_raw", "trend_val")
-for _k in _PRESERVE_KEYS:
-    if _k in st.session_state:
-        st.session_state[_k] = st.session_state[_k]
-
 # ---------------------------------------------------------------
 # ① 질문 생성
 # ---------------------------------------------------------------
@@ -209,26 +229,36 @@ if page == "① 질문 생성":
              + ("" if n_trend else " — ④ 탭에서 먼저 등록하세요."))
 
     gen_thread = st.session_state.get("gen_thread")
-    gen_running = gen_thread is not None and gen_thread.is_alive()
+    gen_running = ((gen_thread is not None and gen_thread.is_alive())
+                   or _generation_lock().locked())  # 다른 세션(탭)의 생성도 포함
 
     st.caption("생성은 백그라운드에서 진행됩니다 — 페이지를 이동하거나 검수를 계속해도 끊기지 "
                "않고, 질문은 만들어지는 즉시 저장됩니다. 진행률은 사이드바에 표시되고, "
                "새 질문은 아래 '질문 정리'와 ② 대기열에서 바로 확인할 수 있습니다.")
     if st.button("생성 시작" if not gen_running else "생성 진행 중...",
                  type="primary", disabled=not picked or gen_running):
-        job = {"total": int(count), "done": 0, "saved": 0, "trend": 0,
-               "status": "running", "error": None, "mode": None}
-        params = dict(
-            count=int(count), domains=picked, mode=mode, model=model,
-            batch=int(batch), exemplars=db.exemplar_records(6),
-            existing_questions=db.all_question_texts(),  # 과거 생성분과 준중복 방지
-            trend_pools=trend_pools, trend_ratio=float(trend_ratio),
-        )
-        worker = threading.Thread(target=_generation_worker, args=(job, params), daemon=True)
-        st.session_state["gen_job"] = job
-        st.session_state["gen_thread"] = worker
-        worker.start()
-        st.rerun()
+        lock = _generation_lock()
+        if not lock.acquire(blocking=False):
+            st.warning("다른 세션(브라우저 탭)에서 생성이 진행 중입니다. 끝난 뒤 다시 시도하세요.")
+        else:
+            try:
+                job = {"total": int(count), "done": 0, "saved": 0, "trend": 0,
+                       "status": "running", "error": None, "mode": None}
+                params = dict(
+                    count=int(count), domains=picked, mode=mode, model=model,
+                    batch=int(batch), exemplars=db.exemplar_records(6),
+                    existing_questions=db.all_question_texts(),  # 과거 생성분과 준중복 방지
+                    trend_pools=trend_pools, trend_ratio=float(trend_ratio),
+                )
+                worker = threading.Thread(target=_generation_worker,
+                                          args=(job, params, lock), daemon=True)
+                st.session_state["gen_job"] = job
+                st.session_state["gen_thread"] = worker
+                worker.start()  # 이후 잠금 해제는 워커의 finally가 담당
+            except BaseException:
+                lock.release()  # 시작에 실패하면 잠금이 남지 않게
+                raise
+            st.rerun()
 
     st.divider()
     st.subheader("질문 정리 — 검수 전에 걸러내기")

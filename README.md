@@ -46,6 +46,7 @@ Ollama가 없으면 자동으로 템플릿 모드로 동작합니다(문장 다�
 | Ollama 설치 중 `requires zstd` | `sudo apt install zstd` 후 재시도 |
 | `gio: ... Operation not supported` | 무해함. WSL엔 브라우저가 없어서 자동 열기 실패 — Windows 브라우저에서 직접 접속 |
 | 첫 실행 시 이메일 입력 프롬프트 | 그냥 Enter. 이 저장소의 `.streamlit/config.toml`이 이후엔 안 뜨게 함 |
+| 코드를 고쳤는데 반영이 안 되는 것 같음 | **다른 인스턴스가 8501을 점유** 중일 수 있음(예: 윈도우 run.bat 서버 + WSL 서버 — WSL2는 localhost를 공유). 사이드바의 '데이터 위치'로 어느 쪽에 접속했는지 확인하고, 한쪽을 끄거나 포트를 분리(`--server.port 8502`) |
 
 ## 동료 PC 배포 — 윈도우 네이티브, 방문 설치 15분
 
