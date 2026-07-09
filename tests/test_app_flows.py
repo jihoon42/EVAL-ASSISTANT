@@ -128,6 +128,50 @@ def test_submit_layout_editor_removes_and_adds_columns():
     assert view.iloc[0]["검색 키워드"] == "강릉 주말 기온 어때?"
 
 
+def _fill_review_form(at: AppTest) -> None:
+    at.session_state["rv_response"] = "카나나 앱 응답 전문"
+    at.session_state["rv_search"] = "sid-guard-1"
+
+
+def test_review_saves_to_displayed_question():
+    """정상 흐름: 현재 질문에 대해 폼을 채우고 저장하면 그 질문에 붙는다."""
+    seed_minimal()
+    at = make_app("② 검수 진행")
+    at.run()
+    assert "서울 내일 비 와?" in [c.value for c in at.code]  # current = q1
+    _fill_review_form(at)
+    [b for b in at.button if "저장하고 다음" in str(b.label)][0].click().run()
+    assert not at.exception, at.exception
+    detail = db.review_detail("q1")
+    assert detail is not None and detail["search_id"] == "sid-guard-1"
+
+
+def test_review_save_blocked_once_when_question_changes_under_filled_form():
+    """오매칭 방지: 입력이 남은 채 질문이 바뀌면 저장을 1회 차단하고,
+    확인(재클릭) 후에는 화면의 질문으로 저장한다."""
+    seed_minimal()
+    at = make_app("② 검수 진행")
+    at.run()
+    _fill_review_form(at)  # q1을 보며 입력해 둔 상황
+    at.run()               # 입력이 q1에 결속됨 (review_form_target=q1)
+
+    # 드롭다운으로 질문 변경 → current가 q2로 바뀌지만 폼 입력은 유지
+    pick = [s for s in at.selectbox if s.key == "review_pick"][0]
+    pick.select("q2").run()
+    assert any("질문이 바뀌었습니다" in str(w.value) for w in at.warning)
+
+    # 저장 시도 1: 차단되어 아무 데도 저장되지 않아야 함
+    [b for b in at.button if "저장하고 다음" in str(b.label)][0].click().run()
+    assert db.review_detail("q1") is None and db.review_detail("q2") is None
+    assert any("저장을 한 번 막았습니다" in str(w.value) for w in at.warning)
+
+    # 저장 시도 2(확인 후): 화면에 보이는 q2로 저장
+    [b for b in at.button if "저장하고 다음" in str(b.label)][0].click().run()
+    assert db.review_detail("q1") is None
+    detail = db.review_detail("q2")
+    assert detail is not None and detail["search_id"] == "sid-guard-1"
+
+
 def test_background_generation_e2e_and_lock():
     at = make_app()
     at.run()

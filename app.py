@@ -498,6 +498,21 @@ if page == "② 검수 진행":
                     "rv_out": VERDICTS[0], "rv_err": [], "rv_out_comment": "",
                     "rv_allow_dup": False,
                 })
+
+            # ---- 입력-질문 결속: 폼 내용이 어느 질문에 대한 것인지 추적 ----
+            # 입력이 남아 있는 채로 current가 바뀌면(필터 변경·건너뛰기·새 질문 유입 등)
+            # 그대로 저장 시 엉뚱한 질문에 검수가 붙는다 → 경고 + 저장 1회 차단으로 방지.
+            form_filled = any(
+                str(st.session_state.get(k, "")).strip()
+                for k in ("rv_response", "rv_search", "rv_acc_comment", "rv_out_comment")
+            ) or st.session_state.get("rv_fail") or st.session_state.get("rv_err")
+            if not form_filled:
+                st.session_state["review_form_target"] = current["id"]
+            elif st.session_state.get("review_form_target") != current["id"]:
+                st.warning("⚠️ 입력 중이던 검수 내용이 있는데 **질문이 바뀌었습니다** "
+                           "(필터 변경·건너뛰기·새 질문 유입 등). 왼쪽 질문과 아래 입력이 "
+                           "같은 건인지 확인하세요 — 저장을 누르면 한 번 더 확인을 거칩니다.")
+
             with st.form("review_form"):
                 response = st.text_area(
                     "카나나 앱 응답 (전문 붙여넣기 — 내부 분석용)", height=160, key="rv_response",
@@ -527,7 +542,12 @@ if page == "② 검수 진행":
             if submitted:
                 dup_fields = db.duplicate_review_fields(
                     current["id"], search_id.strip(), response.strip())
-                if not response.strip():
+                if st.session_state.get("review_form_target") != current["id"]:
+                    # 질문이 바뀐 뒤 첫 저장 시도 → 저장하지 않고 확인 요구
+                    st.session_state["review_form_target"] = current["id"]
+                    st.warning("질문이 바뀐 상태라 저장을 한 번 막았습니다. 왼쪽 질문과 입력이 "
+                               "일치하는지 확인했다면 다시 '저장하고 다음 →'을 눌러주세요.")
+                elif not response.strip():
                     st.warning("앱 응답이 비어 있습니다. 응답 전문을 붙여넣어 주세요.")
                 elif not search_id.strip():
                     st.warning("search ID가 비어 있습니다. 응답을 받았다면 search ID도 반드시 "
