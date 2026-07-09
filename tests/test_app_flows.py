@@ -128,6 +128,62 @@ def test_submit_layout_editor_removes_and_adds_columns():
     assert view.iloc[0]["검색 키워드"] == "강릉 주말 기온 어때?"
 
 
+def test_edit_question_keeps_current_selection():
+    """질문 다듬기로 문구를 고쳐도 보던 질문이 유지되어야 한다
+    (라벨 변경 → 드롭다운 위젯 재생성 → 선택 초기화로 맨 앞 질문으로 튀던 버그)."""
+    seed_minimal()
+    at = make_app("② 검수 진행")
+    at.run()
+    pick = [s for s in at.selectbox if s.key == "review_pick"][0]
+    pick.select("q2").run()
+    assert "부산 모레 눈 온대?" in [c.value for c in at.code]
+
+    at.session_state["edit_q_q2"] = "부산 모레 눈 소식 있어?"
+    [b for b in at.button if str(b.label) == "수정 저장"][0].click().run()
+    assert not at.exception, at.exception
+    assert at.session_state["review_pick"] == "q2", "수정 후 다른 질문으로 튐"
+    assert "부산 모레 눈 소식 있어?" in [c.value for c in at.code], "수정된 질문이 화면에 없음"
+
+
+def test_force_pick_rescues_lost_selection():
+    """드롭다운 위젯 상태가 유실돼도(브라우저 desync 등) 직전 동작이 지정한 질문을
+    서버 측에서 강제 유지한다 — 질문 다듬기 후 맨 앞 질문으로 튀던 실사용 버그의 방어."""
+    seed_minimal()
+    at = make_app("② 검수 진행")
+    at.session_state["review_force_pick"] = "q2"  # 위젯 상태(review_pick)는 없음 = 유실 상황
+    at.run()
+    assert not at.exception, at.exception
+    assert at.session_state["review_pick"] == "q2"
+    assert "부산 모레 눈 온대?" in [c.value for c in at.code]
+    assert "review_force_pick" not in at.session_state  # 1회성으로 소비됨
+
+
+def test_group_filter_survives_queue_changes():
+    """묶음 필터가 건수(라벨) 변화에도 풀리지 않아야 한다."""
+    db.insert_questions([
+        question("a1", "삼성전자 오늘 주가 얼마야?", "2026-07-09T09:00:00",
+                 domain="finance", domain_name="금융", intent="stock_price",
+                 intent_name="시세 조회", slots={"stock": "삼성전자"}),
+        question("a2", "서울 내일 비 와?", "2026-07-09T09:01:00",
+                 intent="precip", intent_name="강수"),
+        question("a3", "카카오 오늘 주가 알려줘", "2026-07-09T09:02:00",
+                 domain="finance", domain_name="금융", intent="stock_price",
+                 intent_name="시세 조회", slots={"stock": "카카오"}),
+    ])
+    at = make_app("② 검수 진행")
+    at.run()
+    group = [s for s in at.selectbox if s.key == "review_group"][0]
+    group.select("금융/시세 조회").run()
+    assert "삼성전자 오늘 주가 얼마야?" in [c.value for c in at.code]
+
+    # 건너뛰기 → 대기열·건수 변화. 필터는 유지되고 같은 묶음의 다음 질문이 나와야 한다.
+    [b for b in at.button if "건너뛰기" in str(b.label)][0].click().run()
+    assert not at.exception, at.exception
+    group = [s for s in at.selectbox if s.key == "review_group"][0]
+    assert group.value == "금융/시세 조회", "묶음 필터가 풀림"
+    assert "카카오 오늘 주가 알려줘" in [c.value for c in at.code]
+
+
 def _fill_review_form(at: AppTest) -> None:
     at.session_state["rv_response"] = "카나나 앱 응답 전문"
     at.session_state["rv_search"] = "sid-guard-1"

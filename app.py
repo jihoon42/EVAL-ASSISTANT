@@ -412,6 +412,9 @@ if page == "② 검수 진행":
             st.session_state.pop("review_group", None)
             if prev_group != "전체":
                 st.toast(f"'{prev_group}' 묶음 검수를 마쳤습니다. 전체 대기열로 돌아갑니다.")
+        elif prev_group is not None:
+            # 건수 표기(라벨) 변화 등으로 위젯이 재생성돼도 필터가 풀리지 않게 API 상태로 재고정
+            st.session_state["review_group"] = prev_group
 
         fc1, fc2 = st.columns([1, 2])
         with fc1:
@@ -430,8 +433,16 @@ if page == "② 검수 진행":
             q["id"]: f"{i + 1}. [{q['domain_name']}/{q['intent_name']}] {q['question'][:60]}"
             for i, q in enumerate(queue)
         }
+        # 직전 동작(질문 다듬기 등)이 "이 질문을 이어서 보여줘라"고 지정한 경우 —
+        # 드롭다운 위젯 상태가 rerun 과정에서 유실·불일치되어도 서버 측에서 강제 유지한다.
+        forced = st.session_state.pop("review_force_pick", None)
+        if forced in queue_ids:
+            st.session_state["review_pick"] = forced
         if st.session_state.get("review_pick") not in queue_ids:
             st.session_state.pop("review_pick", None)
+        else:
+            # 라벨(질문 문구·순번) 변화로 위젯이 재생성돼도 선택이 유지되게 API 상태로 재고정
+            st.session_state["review_pick"] = st.session_state["review_pick"]
         with fc2:
             pick = st.selectbox(
                 "검수할 질문 — 기본은 맨 앞, 입력해서 검색·선택하면 그 질문을 바로 검수",
@@ -474,6 +485,8 @@ if page == "② 검수 진행":
                         st.warning("같은 질문이 이미 존재합니다.")
                     else:
                         db.update_question_text(current["id"], fixed)
+                        # 수정 후에도 같은 질문을 이어서 검수하도록 서버 측에서 고정
+                        st.session_state["review_force_pick"] = current["id"]
                         st.toast("질문을 수정했습니다.")
                         st.rerun()
 
