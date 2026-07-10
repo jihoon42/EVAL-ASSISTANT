@@ -125,8 +125,9 @@ st.session_state["nav_last"] = page
 
 # 페이지를 오가도 작성 중이던 입력이 날아가지 않도록 위젯 상태를 고정한다.
 # (렌더링되지 않은 위젯의 상태는 Streamlit이 정리해 버리므로 재대입으로 보존 표시)
-_PRESERVE_KEYS = ("rv_response", "rv_search", "rv_acc_comment", "rv_out_comment",
-                  "rv_fail", "rv_err", "mq_text", "mq_entities", "submit_layout",
+_PRESERVE_KEYS = ("rv_response", "rv_search", "rv_acc", "rv_fail", "rv_acc_comment",
+                  "rv_out", "rv_err", "rv_out_comment", "rv_allow_dup", "browse_pick",
+                  "review_newest", "mq_text", "mq_entities", "submit_layout",
                   "trend_src", "trend_raw", "trend_val")
 for _k in _PRESERVE_KEYS:
     if _k in st.session_state:
@@ -345,10 +346,107 @@ if page == "① 질문 생성":
         st.dataframe(db.questions_df(), width="stretch", hide_index=True)
 
 # ---------------------------------------------------------------
+# ② 검수 세션 — "지금 검수 중인 질문"을 앱이 소유한다 (review_qid).
+#
+# 드롭다운·정렬 위젯 값에서 매 rerun마다 다시 계산하지 않는다. 화면 표시·입력 폼·저장이
+# 전부 review_qid 하나에서 나오고, review_qid는 명시적 이동(저장 후 자동 진행 / 점프 /
+# 직접 추가)일 때만 바뀌며 바뀔 때 입력 폼을 비운다. → 입력이 남아 있는 한 대상 질문은
+# 절대 바뀌지 않으므로, 저장이 엉뚱한 질문에 붙는 오매칭이 구조적으로 불가능해진다.
+#
+# 입력을 st.form이 아니라 라이브 위젯으로 두는 이유: st.form은 '저장'을 누르기 전까지
+# 입력값을 session_state에 넣지 않아 "입력이 남았는지"를 판정할 수 없었고, 바로 그게
+# 이전 오매칭의 원인이었다. 라이브 위젯은 session_state가 실시간이라 판정이 정확하다.
+# ---------------------------------------------------------------
+RV_BLANK = {"rv_response": "", "rv_search": "", "rv_acc": VERDICTS[0], "rv_fail": [],
+            "rv_acc_comment": "", "rv_out": VERDICTS[0], "rv_err": [],
+            "rv_out_comment": "", "rv_allow_dup": False}
+
+
+def _review_dirty() -> bool:
+    """저장 안 한 검수 입력이 남아 있는가."""
+    s = st.session_state
+    return bool(s.get("rv_response", "").strip() or s.get("rv_search", "").strip()
+                or s.get("rv_acc_comment", "").strip() or s.get("rv_out_comment", "").strip()
+                or s.get("rv_fail") or s.get("rv_err"))
+
+
+def _reset_review_form() -> None:
+    """입력 폼을 비운다. 위젯 인스턴스화 전(페이지 상단 플래그 소비 또는 콜백)에서만 호출."""
+    for k, v in RV_BLANK.items():
+        st.session_state[k] = list(v) if isinstance(v, list) else v
+
+
+def _set_active(qid: str | None, sync_browse: bool = True) -> None:
+    """활성 검수 질문을 바꾸고 입력 폼을 비운다(새 질문에 결속). 콜백/상단 플래그에서만 호출."""
+    st.session_state["review_qid"] = qid
+    _reset_review_form()
+    if sync_browse and qid is not None:
+        st.session_state["browse_pick"] = qid
+
+
+def _group_key(q: dict) -> str:
+    return f"{q['domain_name']}/{q['intent_name']}"
+
+
+def _order_queue(queue: list[dict], newest_first: bool) -> list[dict]:
+    if newest_first:  # 방금 생성한 질문부터
+        return sorted(queue, key=lambda q: (q["created_at"], q["id"]), reverse=True)
+    return queue  # pending_queue()가 이미 검수 순서(우선·수동·생성일시)
+
+
+def _next_after(done: dict, newest_first: bool) -> str | None:
+    """저장/건너뛰기 후 다음 질문 — 같은 인텐트 → 같은 도메인 → 대기열 맨 앞.
+    '날씨 인텐트 끝나면 첫 질문으로 튐'을 없애고 묶어서 검수를 자동화한다."""
+    rest = _order_queue([q for q in db.pending_queue() if q["id"] != done["id"]],
+                        newest_first)
+    if not rest:
+        return None
+    same_intent = [q for q in rest if _group_key(q) == _group_key(done)]
+    if same_intent:
+        return same_intent[0]["id"]
+    same_domain = [q for q in rest if q["domain_name"] == done["domain_name"]]
+    if same_domain:
+        return same_domain[0]["id"]
+    return rest[0]["id"]
+
+
+def _on_browse_jump() -> None:
+    """점프 드롭다운 변경 콜백. 입력이 남아 있으면 확인을 거치고(활성 질문 유지),
+    비어 있으면 즉시 이동한다."""
+    req = st.session_state.get("browse_pick")
+    if req is None or req == st.session_state.get("review_qid"):
+        st.session_state.pop("pending_jump", None)
+        return
+    if _review_dirty():
+        st.session_state["pending_jump"] = req  # 배너로 확인 요구, review_qid는 그대로
+    else:
+        _set_active(req, sync_browse=False)      # browse_pick은 이미 req
+
+
+def _confirm_jump() -> None:
+    req = st.session_state.pop("pending_jump", None)
+    if req is not None:
+        _set_active(req)
+
+
+def _cancel_jump() -> None:
+    st.session_state.pop("pending_jump", None)
+    st.session_state["browse_pick"] = st.session_state.get("review_qid")  # 드롭다운 원위치
+
+
+# ---------------------------------------------------------------
 # ② 검수 진행
 # ---------------------------------------------------------------
 if page == "② 검수 진행":
-    with st.expander("💡 직접 떠올린 질문 추가 — 저장하면 바로 다음 검수 차례가 됩니다"):
+    # 라이브 입력 위젯 기본값(없을 때만). 이후엔 콜백/상단 플래그로만 초기화한다.
+    for _k, _v in RV_BLANK.items():
+        st.session_state.setdefault(_k, list(_v) if isinstance(_v, list) else _v)
+    # 이동 플래그 소비: 위젯이 그려지기 전에 활성 질문을 바꾼다
+    # (위젯 인스턴스화 후 그 상태를 바꾸면 Streamlit이 예외를 던지므로 반드시 여기서).
+    if "review_advance_to" in st.session_state:
+        _set_active(st.session_state.pop("review_advance_to"))
+
+    with st.expander("💡 직접 떠올린 질문 추가 — 저장하면 대기열에 들어갑니다"):
         st.caption(
             "테스트 중 생각난 질문을 여기 먼저 등록하면: ① 과거에 이미 (비슷하게) 테스트한 질문이면 "
             "알려줘서 중복 검수를 막고, ② 생성 질문과 같은 흐름으로 기록·집계·제출양식에 자동 포함되며, "
@@ -382,8 +480,9 @@ if page == "② 검수 진행":
                 else:
                     slots = {f"entity{i + 1}": v.strip()
                              for i, v in enumerate(mq_entities.split(",")) if v.strip()}
+                    new_id = uuid.uuid4().hex[:12]
                     db.insert_questions([{
-                        "id": uuid.uuid4().hex[:12],
+                        "id": new_id,
                         "domain": mq_domain,
                         "domain_name": DOMAIN_LABELS.get(mq_domain, "기타"),
                         "intent": "manual", "intent_name": "직접 작성",
@@ -392,63 +491,59 @@ if page == "② 검수 진행":
                         "created_at": datetime.now().isoformat(timespec="seconds"),
                     }])
                     st.session_state["mq_clear"] = True
-                    st.toast("추가했습니다. 바로 아래에서 검수하세요.")
+                    # 검수 입력이 없을 때만 방금 추가한 질문으로 바로 이동(입력 유실 방지).
+                    if _review_dirty():
+                        st.toast("대기열에 추가했습니다. 지금 검수를 저장한 뒤 이동하세요.")
+                    else:
+                        st.session_state["review_advance_to"] = new_id
+                        st.toast("추가했습니다. 바로 아래에서 검수하세요.")
                     st.rerun()
 
     queue = db.pending_queue()
     if not queue:
+        st.session_state.pop("review_qid", None)
         current = None
         st.info("대기 중인 질문이 없습니다. ① 탭에서 질문을 생성하세요.")
     else:
-        # 묶어서 검수: 같은 인텐트 질문을 연달아 진행. 대기열의 저장 순서(DB)는 불변 —
-        # ② 탭에서 보여주고 이어가는 순서만 좁힌다. 묶음이 소진되면 전체로 복귀.
-        group_counts: dict[str, int] = {}
-        for q in queue:
-            g = f"{q['domain_name']}/{q['intent_name']}"
-            group_counts[g] = group_counts.get(g, 0) + 1
-        group_options = ["전체"] + sorted(group_counts)
-        prev_group = st.session_state.get("review_group")
-        if prev_group is not None and prev_group not in group_options:
-            st.session_state.pop("review_group", None)
-            if prev_group != "전체":
-                st.toast(f"'{prev_group}' 묶음 검수를 마쳤습니다. 전체 대기열로 돌아갑니다.")
-        elif prev_group is not None:
-            # 건수 표기(라벨) 변화 등으로 위젯이 재생성돼도 필터가 풀리지 않게 API 상태로 재고정
-            st.session_state["review_group"] = prev_group
+        newest_first = st.session_state.get("review_newest", False)
+        ordered = _order_queue(queue, newest_first)
+        qids = [q["id"] for q in ordered]
 
-        fc1, fc2 = st.columns([1, 2])
-        with fc1:
-            group = st.selectbox(
-                "묶어서 검수 (인텐트)", group_options, key="review_group",
-                format_func=lambda g: g if g == "전체" else f"{g} ({group_counts[g]}건)",
-                help="선택하면 이 인텐트의 질문만 순서대로 이어서 검수합니다. "
-                     "대기열 순서 자체는 바뀌지 않습니다.")
-        if group != "전체":
-            queue = [q for q in queue if f"{q['domain_name']}/{q['intent_name']}" == group]
+        # 활성 질문 확정(없거나 대기열에서 사라졌으면 정렬 순 맨 앞으로) — 위젯 그리기 전.
+        active = st.session_state.get("review_qid")
+        if active not in qids:
+            active = qids[0]
+            st.session_state["review_qid"] = active
+            st.session_state["browse_pick"] = active
+        current = next(q for q in ordered if q["id"] == active)
 
-        # 선택 검수: 기본은 (묶음 내) 맨 앞, 드롭다운에 타이핑하면 검색됨 (예: "바비").
-        # 선택한 질문을 저장/건너뛰기/제외하면 대기열에서 빠지므로 자동으로 다음으로 넘어간다.
-        queue_ids = [q["id"] for q in queue]
-        queue_labels = {
-            q["id"]: f"{i + 1}. [{q['domain_name']}/{q['intent_name']}] {q['question'][:60]}"
-            for i, q in enumerate(queue)
-        }
-        # 직전 동작(질문 다듬기 등)이 "이 질문을 이어서 보여줘라"고 지정한 경우 —
-        # 드롭다운 위젯 상태가 rerun 과정에서 유실·불일치되어도 서버 측에서 강제 유지한다.
-        forced = st.session_state.pop("review_force_pick", None)
-        if forced in queue_ids:
-            st.session_state["review_pick"] = forced
-        if st.session_state.get("review_pick") not in queue_ids:
-            st.session_state.pop("review_pick", None)
-        else:
-            # 라벨(질문 문구·순번) 변화로 위젯이 재생성돼도 선택이 유지되게 API 상태로 재고정
-            st.session_state["review_pick"] = st.session_state["review_pick"]
-        with fc2:
-            pick = st.selectbox(
-                "검수할 질문 — 기본은 맨 앞, 입력해서 검색·선택하면 그 질문을 바로 검수",
-                queue_ids, format_func=lambda i: queue_labels[i], key="review_pick",
-            )
-        current = next(q for q in queue if q["id"] == pick)
+        st.caption(f"대기 {len(queue)}건 · 저장하면 **같은 인텐트의 다음 질문**으로 자동 진행합니다 "
+                   "(그 인텐트가 끝나면 같은 도메인 → 대기열 순). 특정 질문을 지금 보려면 오른쪽에서 점프하세요.")
+        cc1, cc2 = st.columns([1, 2])
+        with cc1:
+            st.toggle("최신 생성 먼저", key="review_newest",
+                      help="켜면 방금 생성한 질문부터 검수합니다(점프 목록·자동 진행 순서에 반영).")
+        with cc2:
+            labels = {q["id"]: f"{i + 1}. [{q['domain_name']}/{q['intent_name']}] "
+                               f"{q['question'][:60]}" for i, q in enumerate(ordered)}
+            if st.session_state.get("browse_pick") not in qids:
+                st.session_state["browse_pick"] = active
+            st.selectbox(
+                "다른 질문으로 점프 — 입력해서 검색·선택 (예: 바비)", qids,
+                format_func=lambda i: labels[i], key="browse_pick",
+                on_change=_on_browse_jump)
+
+        # 저장 안 한 입력이 있는데 점프를 시도한 경우 — 확인 배너(활성 질문은 유지).
+        pj = st.session_state.get("pending_jump")
+        if pj is not None and pj in qids:
+            pj_q = next(q for q in ordered if q["id"] == pj)
+            st.warning(f"저장 안 한 검수 입력이 있습니다. **{pj_q['question'][:40]}**(으)로 "
+                       "이동하면 지금 입력이 사라집니다. 저장 후 이동하거나, 버리고 이동하세요.")
+            jc1, jc2, _ = st.columns([1, 1, 3])
+            jc1.button("버리고 이동", on_click=_confirm_jump)
+            jc2.button("현재 유지", on_click=_cancel_jump)
+        elif pj is not None:
+            st.session_state.pop("pending_jump", None)  # 대상이 사라짐
 
         left, right = st.columns([3, 2])
         with left:
@@ -485,82 +580,54 @@ if page == "② 검수 진행":
                         st.warning("같은 질문이 이미 존재합니다.")
                     else:
                         db.update_question_text(current["id"], fixed)
-                        # 수정 후에도 같은 질문을 이어서 검수하도록 서버 측에서 고정
-                        st.session_state["review_force_pick"] = current["id"]
                         st.toast("질문을 수정했습니다.")
-                        st.rerun()
+                        st.rerun()  # review_qid 그대로 → 같은 질문(새 문구)이 유지된다
 
             b1, b2 = st.columns(2)
             if b1.button("이 질문 건너뛰기"):
                 db.skip_question(current["id"])
+                st.session_state["review_advance_to"] = _next_after(current, newest_first)
                 st.rerun()
             if b2.button("질문 결함 → 제외",
                          help="비문·의미 붕괴 등 질문 자체가 잘못된 경우. "
                               "검수 대상에서 제외되고, 검수 통과 질문만 few-shot 예시로 재사용됩니다."):
                 db.reject_question(current["id"])
+                st.session_state["review_advance_to"] = _next_after(current, newest_first)
                 st.toast("결함 질문으로 제외했습니다.")
                 st.rerun()
 
         with right:
             st.subheader("검수 결과 기록")
-            # 저장 성공 직후에만 폼을 비운다 — 경고에 걸렸을 땐 입력(긴 응답 붙여넣기)을 보존
-            if st.session_state.pop("review_clear", False):
-                st.session_state.update({
-                    "rv_response": "", "rv_search": "",
-                    "rv_acc": VERDICTS[0], "rv_fail": [], "rv_acc_comment": "",
-                    "rv_out": VERDICTS[0], "rv_err": [], "rv_out_comment": "",
-                    "rv_allow_dup": False,
-                })
+            st.caption("입력은 **지금 왼쪽에 보이는 질문**에 저장됩니다. 다른 질문으로 점프하면 "
+                       "입력이 비워지므로, 한 질문을 끝내 저장한 뒤 다음으로 넘어가세요.")
+            response = st.text_area(
+                "카나나 앱 응답 (전문 붙여넣기 — 내부 분석용)", height=160, key="rv_response",
+                placeholder="앱에서 받은 응답을 그대로 붙여넣으세요.")
+            search_id = st.text_input(
+                "search ID (응답을 받으면 앱에 반드시 함께 생성됩니다)", key="rv_search")
 
-            # ---- 입력-질문 결속: 폼 내용이 어느 질문에 대한 것인지 추적 ----
-            # 입력이 남아 있는 채로 current가 바뀌면(필터 변경·건너뛰기·새 질문 유입 등)
-            # 그대로 저장 시 엉뚱한 질문에 검수가 붙는다 → 경고 + 저장 1회 차단으로 방지.
-            form_filled = any(
-                str(st.session_state.get(k, "")).strip()
-                for k in ("rv_response", "rv_search", "rv_acc_comment", "rv_out_comment")
-            ) or st.session_state.get("rv_fail") or st.session_state.get("rv_err")
-            if not form_filled:
-                st.session_state["review_form_target"] = current["id"]
-            elif st.session_state.get("review_form_target") != current["id"]:
-                st.warning("⚠️ 입력 중이던 검수 내용이 있는데 **질문이 바뀌었습니다** "
-                           "(필터 변경·건너뛰기·새 질문 유입 등). 왼쪽 질문과 아래 입력이 "
-                           "같은 건인지 확인하세요 — 저장을 누르면 한 번 더 확인을 거칩니다.")
+            st.markdown("**1) 정확도**")
+            acc_verdict = st.radio("정확도 판정", VERDICTS, horizontal=True,
+                                   label_visibility="collapsed", key="rv_acc")
+            fail_types = st.multiselect("N 사유 (fail 시 선택)", FAIL_TYPES, key="rv_fail")
+            acc_comment = st.text_area("정확도 코멘트", key="rv_acc_comment", height=68)
 
-            with st.form("review_form"):
-                response = st.text_area(
-                    "카나나 앱 응답 (전문 붙여넣기 — 내부 분석용)", height=160, key="rv_response",
-                    placeholder="앱에서 받은 응답을 그대로 붙여넣으세요.",
-                )
-                search_id = st.text_input(
-                    "search ID (응답을 받으면 앱에 반드시 함께 생성됩니다)", key="rv_search")
+            st.markdown("**2) LLM 출력**")
+            out_verdict = st.radio("LLM 출력 판정", VERDICTS, horizontal=True,
+                                   label_visibility="collapsed", key="rv_out")
+            output_errors = st.multiselect("오류 유형 (fail 시 선택)", OUTPUT_ERROR_TYPES,
+                                           key="rv_err")
+            out_comment = st.text_area("출력 오류 코멘트", key="rv_out_comment", height=68)
 
-                st.markdown("**1) 정확도**")
-                acc_verdict = st.radio("정확도 판정", VERDICTS, horizontal=True,
-                                       label_visibility="collapsed", key="rv_acc")
-                fail_types = st.multiselect("N 사유 (fail 시 선택)", FAIL_TYPES, key="rv_fail")
-                acc_comment = st.text_area("정확도 코멘트", key="rv_acc_comment", height=68)
+            allow_dup = st.checkbox(
+                "이전 검수와 같은 search ID/앱 응답이어도 저장", key="rv_allow_dup",
+                help="서로 다른 질문에 동일한 폴백 응답이 온 경우처럼 드문 상황에서만 켜세요.")
 
-                st.markdown("**2) LLM 출력**")
-                out_verdict = st.radio("LLM 출력 판정", VERDICTS, horizontal=True,
-                                       label_visibility="collapsed", key="rv_out")
-                output_errors = st.multiselect("오류 유형 (fail 시 선택)", OUTPUT_ERROR_TYPES,
-                                               key="rv_err")
-                out_comment = st.text_area("출력 오류 코멘트", key="rv_out_comment", height=68)
-
-                allow_dup = st.checkbox(
-                    "이전 검수와 같은 search ID/앱 응답이어도 저장", key="rv_allow_dup",
-                    help="서로 다른 질문에 동일한 폴백 응답이 온 경우처럼 드문 상황에서만 켜세요.")
-                submitted = st.form_submit_button("저장하고 다음 →", type="primary")
-
-            if submitted:
+            if st.button("저장하고 다음 →", type="primary", key="rv_save"):
+                qid = st.session_state["review_qid"]  # 소유값 = 왼쪽에 보이는 그 질문
                 dup_fields = db.duplicate_review_fields(
-                    current["id"], search_id.strip(), response.strip())
-                if st.session_state.get("review_form_target") != current["id"]:
-                    # 질문이 바뀐 뒤 첫 저장 시도 → 저장하지 않고 확인 요구
-                    st.session_state["review_form_target"] = current["id"]
-                    st.warning("질문이 바뀐 상태라 저장을 한 번 막았습니다. 왼쪽 질문과 입력이 "
-                               "일치하는지 확인했다면 다시 '저장하고 다음 →'을 눌러주세요.")
-                elif not response.strip():
+                    qid, search_id.strip(), response.strip())
+                if not response.strip():
                     st.warning("앱 응답이 비어 있습니다. 응답 전문을 붙여넣어 주세요.")
                 elif not search_id.strip():
                     st.warning("search ID가 비어 있습니다. 응답을 받았다면 search ID도 반드시 "
@@ -575,7 +642,7 @@ if page == "② 검수 진행":
                                "실제로 같은 값이 맞다면 체크박스를 켜고 다시 저장하세요.")
                 else:
                     db.save_review(
-                        current["id"], response.strip(),
+                        qid, response.strip(),
                         accuracy_verdict=acc_verdict,
                         fail_type=", ".join(fail_types),
                         accuracy_comment=acc_comment.strip(),
@@ -586,8 +653,8 @@ if page == "② 검수 진행":
                         reviewer=st.session_state.get("reviewer", ""),
                         phase=st.session_state.get("phase", ""),
                     )
-                    st.session_state["last_reviewed"] = current["id"]
-                    st.session_state["review_clear"] = True
+                    st.session_state["last_reviewed"] = qid
+                    st.session_state["review_advance_to"] = _next_after(current, newest_first)
                     st.toast("저장 완료")
                     st.rerun()
 
@@ -599,6 +666,7 @@ if page == "② 검수 진행":
                           "붙여넣기 실수를 바로 알아챘을 때 쓰세요."):
             db.reopen_review(last_id)
             del st.session_state["last_reviewed"]
+            st.session_state["review_advance_to"] = last_id  # 그 질문으로 돌아가 재검수
             st.toast("되돌렸습니다. 해당 질문이 다시 검수 차례로 돌아옵니다.")
             st.rerun()
 
@@ -665,6 +733,13 @@ if page == "③ 결과·내보내기":
             view_results = results
         if scope != "전체":
             st.caption(f"선택 범위 검수 {len(view_results)}건 (전체 {len(results)}건)")
+        # 도메인 필터 — 본사 제출은 도메인별 시트라, 화면에서도 한 도메인씩 골라 복사할 수 있게.
+        # (xlsx는 이 필터와 무관하게 항상 도메인별 시트로 나뉘어 나간다.)
+        doms = sorted(d for d in view_results["도메인"].dropna().unique())
+        dsel = st.selectbox(
+            "도메인", ["전체"] + doms, key="submit_domain",
+            help="화면 표는 고른 도메인만 보여줍니다. xlsx는 도메인별 시트로 나뉘어 나갑니다.")
+        dview = view_results if dsel == "전체" else view_results[view_results["도메인"] == dsel]
         with st.expander("컬럼 구성 수정 — 카카오 양식에 열이 추가·삭제되면 여기서 맞추기"):
             st.caption(
                 "한 줄이 컬럼 하나이고 순서 그대로 아래 표와 xlsx에 반영됩니다. "
@@ -680,13 +755,6 @@ if page == "③ 결과·내보내기":
         if not layout:
             layout = list(DEFAULT_SUBMIT_LAYOUT)
 
-        def submit_series(name: str) -> pd.Series:
-            if name in SUBMIT_DERIVED:
-                return SUBMIT_DERIVED[name](view_results)
-            if name in view_results.columns:
-                return view_results[name]
-            return pd.Series("", index=view_results.index)  # 카카오 측 기입란 → 빈 컬럼
-
         def unique_columns(names: list[str]) -> list[str]:
             """화면 표시용 중복 해소 — 같은 이름 뒤에 보이지 않는 공백을 붙인다."""
             seen: dict[str, int] = {}
@@ -697,8 +765,21 @@ if page == "③ 결과·내보내기":
                 seen[n] = k + 1
             return out
 
-        submit = pd.concat([submit_series(n) for n in layout], axis=1)
-        submit.columns = unique_columns(layout)
+        def submit_series(df: pd.DataFrame, name: str) -> pd.Series:
+            if name in SUBMIT_DERIVED:
+                return SUBMIT_DERIVED[name](df)
+            if name in df.columns:
+                return df[name]
+            return pd.Series("", index=df.index)  # 카카오 측 기입란 → 빈 컬럼
+
+        def build_submit(df: pd.DataFrame, display: bool) -> pd.DataFrame:
+            """제출양식 프레임. display=True면 화면용(중복 헤더에 보이지 않는 공백),
+            False면 xlsx용(원래 이름 그대로 — '기획 검수' 2개도 유지)."""
+            out = pd.concat([submit_series(df, n) for n in layout], axis=1)
+            out.columns = unique_columns(layout) if display else list(layout)
+            return out
+
+        submit = build_submit(dview, display=True)
         st.dataframe(submit, width="stretch", hide_index=True)
         st.caption("열 머리글 메뉴로 화면에서 열을 숨길 수도 있습니다. "
                    "숨김은 화면에만 적용되고 xlsx에는 위 컬럼 구성이 그대로 나갑니다.")
@@ -785,23 +866,32 @@ if page == "③ 결과·내보내기":
                     st.toast("삭제했습니다.")
                     st.rerun()
 
-        # ---- xlsx 추출: '제출양식' 시트는 위 표와 동일, 헤더는 양식 원래 이름 그대로 ----
-        submit_x = submit.copy()
-        submit_x.columns = layout  # 동일 이름 컬럼(기획 검수 2개)도 그대로 유지
+        # ---- xlsx 추출: 도메인별 시트(본사 제출용) + 전체 + 요약 + 내부분석 ----
+        # 시트는 날짜 범위(view_results) 기준이며, 화면 도메인 필터와 무관하게 도메인마다 나뉜다.
+        # 헤더는 양식 원래 이름 그대로('기획 검수' 2개 유지).
+        def _sheet_name(name: str) -> str:
+            for ch in "[]:*?/\\":
+                name = name.replace(ch, "_")
+            return name[:31]  # 엑셀 시트명 31자 제한
+
         buf = BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            submit_x.to_excel(writer, sheet_name="제출양식", index=False)
+            for dname, dgroup in view_results.groupby("도메인"):
+                build_submit(dgroup, display=False).to_excel(
+                    writer, sheet_name=_sheet_name(f"제출_{dname}"), index=False)
+            build_submit(view_results, display=False).to_excel(
+                writer, sheet_name="제출양식_전체", index=False)
             pivot.reset_index().to_excel(writer, sheet_name="요약", index=False)
             results.to_excel(writer, sheet_name="내부분석", index=False)
         st.download_button(
-            "📥 xlsx 다운로드 (제출양식 + 요약 + 내부분석)",
+            "📥 xlsx 다운로드 (도메인별 시트 + 전체 + 요약 + 내부분석)",
             data=buf.getvalue(),
             file_name=f"E2E_품질평가_{date.today().isoformat()}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
         )
-        st.caption("※ '내부분석' 시트에는 앱 응답 전문·도메인·인텐트가 포함됩니다. "
-                   "카카오 제출 시 '제출양식' 시트만 복사해 쓰세요.")
+        st.caption("※ 도메인별 시트(제출_날씨 / 제출_로컬 / …)를 각 제출 시트에 그대로 복사하세요. "
+                   "'내부분석' 시트에는 앱 응답 전문·도메인·인텐트가 포함되니 제출본에서는 빼세요.")
 
 # ---------------------------------------------------------------
 # ④ 트렌드 시드 (최신 기사·리뷰 → 엔티티 추출 → 생성에 혼입)
