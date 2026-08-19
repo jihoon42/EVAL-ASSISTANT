@@ -310,3 +310,93 @@ def test_background_extraction_e2e():
     assert "ext_job" not in at.session_state
     assert "trend_cands" in at.session_state
     assert any(str(b.label) == "후보 추출" for b in at.button), "잠금이 해제되지 않음"
+
+
+# ---------------------------------------------------------------
+# 시드 출처 표시 (② 배경 패널 / ③ 제출본 유출 방지 / ④ 입력)
+# ---------------------------------------------------------------
+
+def _trend_seed_with_source() -> None:
+    db.add_trend_seeds([{
+        "value": "두쫀쿠", "pool": "hot_item", "source": "편의점 디저트 1위",
+        "source_url": "https://example.com/a", "source_date": "2026-08-18",
+        "evidence": "두쫀쿠가 매출 1위에 올랐다.",
+        "expires_at": (date.today() + timedelta(days=7)).isoformat()}])
+
+
+def test_review_shows_seed_background_for_trend_question():
+    _trend_seed_with_source()
+    db.insert_questions([question(
+        "t1", "두쫀쿠 어디서 살 수 있어?", "2026-08-19T09:00:00",
+        slots={"hot_item": "두쫀쿠"}, trend_slots=["hot_item"], seed_origin="trend")])
+
+    at = make_app("② 검수 진행")
+    at.run()
+    assert not at.exception, at.exception
+    labels = [e.label for e in at.expander]
+    assert any("이 질문의 배경" in lb for lb in labels), labels
+    body = " ".join(str(m.value) for m in at.markdown)
+    assert "https://example.com/a" in body
+    assert "배경 참고" in " ".join(str(c.value) for c in at.caption)
+
+
+def test_review_has_no_background_panel_for_base_question():
+    """기본 시드 질문에는 배경 패널이 뜨지 않아야 한다 (없는 근거를 암시하지 않게)."""
+    db.insert_questions([question("b1", "서울 내일 비 와?", "2026-08-19T09:00:00")])
+    at = make_app("② 검수 진행")
+    at.run()
+    assert not at.exception, at.exception
+    assert not any("이 질문의 배경" in e.label for e in at.expander)
+
+
+def test_seed_evidence_never_reaches_submit_sheet():
+    """'시드근거'는 내부분석 전용 — 카카오 제출양식 뷰에 절대 나가면 안 된다."""
+    _trend_seed_with_source()
+    db.insert_questions([question(
+        "t1", "두쫀쿠 어디서 살 수 있어?", "2026-08-19T09:00:00",
+        slots={"hot_item": "두쫀쿠"}, trend_slots=["hot_item"], seed_origin="trend")])
+    db.save_review("t1", "응답", "fail", "최신성", "", "pass", "", "", "s9", "t", "cbt")
+
+    at = make_app("③ 결과·내보내기")
+    at.run()
+    assert not at.exception, at.exception
+    assert "시드근거" in db.results_df().columns
+    # 제출양식 뷰 = '기획 검수'(카카오 기입란)가 있는 프레임. 내부분석 뷰와 구분된다.
+    subs = [d.value for d in at.dataframe
+            if "검색 키워드" in d.value.columns and "기획 검수" in d.value.columns]
+    assert subs, "제출양식 뷰를 찾지 못함"
+    assert all("시드근거" not in list(s.columns) for s in subs)
+    # 내부분석 뷰에는 반대로 있어야 한다 (최신성 fail 되짚기용)
+    internal = [d.value for d in at.dataframe if "앱 응답" in d.value.columns]
+    assert internal and "시드근거" in list(internal[0].columns)
+
+
+def test_trend_tab_registers_source_fields():
+    at = make_app("④ 트렌드 시드")
+    at.run()
+    assert not at.exception, at.exception
+    keys = {i.key for i in at.text_input}
+    assert {"trend_src", "trend_src_url", "trend_src_date"} <= keys, keys
+
+    at.text_input(key="trend_src").set_value("편의점 디저트 1위")
+    at.text_input(key="trend_src_url").set_value("https://example.com/a")
+    at.text_input(key="trend_src_date").set_value("2026-08-18")
+    at.text_area(key="trend_evidence").set_value("두쫀쿠가 매출 1위에 올랐다.")
+    at.text_input(key="trend_val").set_value("두쫀쿠")
+    at.run()
+    at.button[-1].click().run()
+    assert not at.exception, at.exception
+
+    row = db.trend_seeds_df().iloc[0]
+    assert row["값"] == "두쫀쿠"
+    assert row["출처URL"] == "https://example.com/a"
+    assert row["기사일자"] == "2026-08-18"
+
+
+def test_trend_tab_warns_on_malformed_article_date():
+    at = make_app("④ 트렌드 시드")
+    at.run()
+    at.text_input(key="trend_src_date").set_value("8월 18일")
+    at.run()
+    assert not at.exception, at.exception
+    assert any("YYYY-MM-DD" in str(w.value) for w in at.warning), [w.value for w in at.warning]

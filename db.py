@@ -57,13 +57,16 @@ def init_db() -> None:
             reviewed_at       TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS trend_seeds (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            value      TEXT NOT NULL,           -- 시드 값 (예: 두쫀쿠)
-            pool       TEXT NOT NULL,           -- 주입할 슬롯 풀 이름 (예: food_category)
-            source     TEXT,                    -- 출처 메모 (기사 제목·URL)
-            added_at   TEXT NOT NULL,
-            expires_at TEXT,                    -- YYYY-MM-DD, NULL이면 무기한
-            active     INTEGER NOT NULL DEFAULT 1,
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            value       TEXT NOT NULL,          -- 시드 값 (예: 두쫀쿠)
+            pool        TEXT NOT NULL,          -- 주입할 슬롯 풀 이름 (예: food_category)
+            source      TEXT,                   -- 출처 제목 (기사·리뷰 제목 또는 자유 메모)
+            source_url  TEXT,                   -- 출처 URL (검수자가 원문으로 갈 수 있게)
+            source_date TEXT,                   -- 기사 일자 YYYY-MM-DD (최신성 판단 기준)
+            evidence    TEXT,                   -- 이 시드가 나온 대목 한두 문장 (배경 참고용)
+            added_at    TEXT NOT NULL,
+            expires_at  TEXT,                   -- YYYY-MM-DD, NULL이면 무기한
+            active      INTEGER NOT NULL DEFAULT 1,
             UNIQUE(value, pool)
         );
         """)
@@ -82,10 +85,24 @@ def init_db() -> None:
             # 1이면 검수 대기열 맨 앞 ("먼저 검수" 지정)
             conn.execute(
                 "ALTER TABLE questions ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
+        if "trend_slots" not in qcols:
+            # 트렌드 시드에서 값을 받은 슬롯 이름 JSON 배열. 예: ["hot_item"]
+            # 시드 id가 아니라 슬롯 이름을 남기는 이유: 값은 slots_json에 이미 있고
+            # trend_seeds가 (pool, value) 유일키이므로 자연키 조회가 되며, 시드를
+            # 지웠다 다시 등록해도 참조가 끊기지 않는다.
+            conn.execute("ALTER TABLE questions ADD COLUMN trend_slots TEXT NOT NULL DEFAULT ''")
+        scols = {row[1] for row in conn.execute("PRAGMA table_info(trend_seeds)")}
+        for col in ("source_url", "source_date", "evidence"):
+            if col not in scols:
+                conn.execute(f"ALTER TABLE trend_seeds ADD COLUMN {col} TEXT")
 
 
 def insert_questions(records: list[dict]) -> int:
-    """generate.py 레코드를 저장. 중복 id는 무시. 저장 건수 반환."""
+    """generate.py 레코드를 저장. 중복 id는 무시. 저장 건수 반환.
+
+    trend_slots(트렌드 시드에서 값을 받은 슬롯 이름 목록)가 있으면 함께 남긴다 —
+    ② 탭에서 "이 질문의 배경"으로 출처 기사를 되짚는 근거가 된다.
+    """
     rows = [
         (
             r["id"], r["domain"], r["domain_name"], r["intent"], r["intent_name"],
@@ -93,6 +110,7 @@ def insert_questions(records: list[dict]) -> int:
             json.dumps(r["style"], ensure_ascii=False),
             r["question"], r["gen_mode"], r.get("model"), r["created_at"],
             r.get("seed_origin", "base"),
+            json.dumps(r["trend_slots"], ensure_ascii=False) if r.get("trend_slots") else "",
         )
         for r in records
     ]
@@ -100,8 +118,8 @@ def insert_questions(records: list[dict]) -> int:
         cur = conn.executemany(
             "INSERT OR IGNORE INTO questions "
             "(id, domain, domain_name, intent, intent_name, slots_json, style_json,"
-            " question, gen_mode, model, created_at, seed_origin) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            " question, gen_mode, model, created_at, seed_origin, trend_slots) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             rows,
         )
         return cur.rowcount
@@ -299,16 +317,50 @@ def curation_df() -> pd.DataFrame:
 # ---------------------------------------------------------------
 
 def add_trend_seeds(items: list[dict]) -> int:
-    """트렌드 시드 등록. (값, 풀) 중복은 무시. items: {value, pool, source, expires_at}"""
+    """트렌드 시드 등록. (값, 풀) 중복은 무시.
+
+    items: {value, pool, source, source_url, source_date, evidence, expires_at}
+    source 계열은 전부 선택값이다 — 없으면 빈 문자열로 저장되고, ② 탭 배경 패널은
+    채워진 항목만 보여준다.
+    """
     now = datetime.now().isoformat(timespec="seconds")
     with get_conn() as conn:
         cur = conn.executemany(
-            "INSERT OR IGNORE INTO trend_seeds (value, pool, source, added_at, expires_at)"
-            " VALUES (?,?,?,?,?)",
-            [(i["value"], i["pool"], i.get("source", ""), now, i.get("expires_at"))
+            "INSERT OR IGNORE INTO trend_seeds"
+            " (value, pool, source, source_url, source_date, evidence, added_at, expires_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            [(i["value"], i["pool"], i.get("source", ""), i.get("source_url", ""),
+              i.get("source_date", ""), i.get("evidence", ""), now, i.get("expires_at"))
              for i in items],
         )
         return cur.rowcount
+
+
+def question_sources(question_id: str) -> list[dict]:
+    """질문이 쓴 트렌드 시드의 출처 정보 (② 탭 '이 질문의 배경' 패널용).
+
+    questions.trend_slots(슬롯 이름) + slots_json(그 슬롯의 값)으로 trend_seeds를
+    자연키 조회한다. 시드가 지워졌으면 그 항목은 빠진다 — 없는 출처를 지어내지 않는다.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT slots_json, trend_slots FROM questions WHERE id=?", (question_id,)
+        ).fetchone()
+        if row is None or not row["trend_slots"]:
+            return []
+        slots = json.loads(row["slots_json"])
+        out: list[dict] = []
+        for slot in json.loads(row["trend_slots"]):
+            value = slots.get(slot)
+            if value is None:
+                continue
+            seed = conn.execute(
+                "SELECT value, pool, source, source_url, source_date, evidence, added_at,"
+                " expires_at FROM trend_seeds WHERE pool=? AND value=?", (slot, value)
+            ).fetchone()
+            if seed is not None:
+                out.append(dict(seed))
+        return out
 
 
 def active_trend_seeds() -> dict[str, list[str]]:
@@ -332,6 +384,7 @@ def trend_seeds_df() -> pd.DataFrame:
     with get_conn() as conn:
         df = pd.read_sql_query(
             "SELECT id, value AS 값, pool AS 풀, source AS 출처,"
+            " source_url AS 출처URL, source_date AS 기사일자, evidence AS 발췌,"
             " added_at AS 등록일시, expires_at AS 만료일, active"
             " FROM trend_seeds ORDER BY added_at DESC, id DESC",
             conn,
@@ -361,17 +414,48 @@ def questions_df() -> pd.DataFrame:
 
 
 def results_df() -> pd.DataFrame:
-    """검수 완료 건 조인 뷰 (xlsx 추출/대시보드용). 컬럼명은 제출 양식 기준."""
+    """검수 완료 건 조인 뷰 (xlsx 추출/대시보드용). 컬럼명은 제출 양식 기준.
+
+    '시드근거'는 트렌드 시드 질문의 출처 기사를 한 줄로 붙인 것 — 최신성 fail을
+    나중에 되짚을 때 필요하다. 내부분석 시트에만 들어가고 제출본에는 나가지 않는다
+    (제출 레이아웃이 컬럼을 이름으로 골라 쓰므로 자동으로 빠진다).
+    """
     with get_conn() as conn:
-        return pd.read_sql_query(
+        df = pd.read_sql_query(
             "SELECT r.phase AS 단계, r.reviewed_at AS 검수일시, r.reviewer AS 테스터,"
             " r.search_id AS 'search ID', q.question AS '검색 키워드',"
             " r.verdict AS '1) 정확도', r.fail_type AS 'N 사유', r.reason AS '정확도 코멘트',"
             " r.output_verdict AS '2) LLM 출력', r.output_error_type AS '오류 유형',"
             " r.output_comment AS '출력 오류 코멘트',"
             " q.domain_name AS 도메인, q.intent_name AS 인텐트, r.response AS '앱 응답',"
-            " q.gen_mode AS 생성모드, q.seed_origin AS 시드출처, q.id AS 질문ID"
+            " q.gen_mode AS 생성모드, q.seed_origin AS 시드출처, q.id AS 질문ID,"
+            " q.slots_json, q.trend_slots"
             " FROM reviews r JOIN questions q ON q.id = r.question_id"
             " ORDER BY r.reviewed_at",
             conn,
         )
+        seeds = {
+            (r["pool"], r["value"]): r
+            for r in conn.execute(
+                "SELECT pool, value, source, source_url, source_date FROM trend_seeds")
+        }
+
+    def label(slots_json: str, trend_slots: str) -> str:
+        if not trend_slots:
+            return ""
+        slots = json.loads(slots_json)
+        parts = []
+        for slot in json.loads(trend_slots):
+            seed = seeds.get((slot, slots.get(slot)))
+            if seed is None:
+                continue
+            bits = [b for b in (seed["source_date"], seed["source"], seed["source_url"]) if b]
+            value = str(slots[slot])
+            parts.append(f"{value}: " + " / ".join(bits) if bits else value)
+        return " | ".join(parts)
+
+    if df.empty:
+        df["시드근거"] = pd.Series(dtype="object")
+    else:
+        df["시드근거"] = [label(s, t) for s, t in zip(df["slots_json"], df["trend_slots"])]
+    return df.drop(columns=["slots_json", "trend_slots"])

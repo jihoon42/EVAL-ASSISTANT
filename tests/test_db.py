@@ -168,3 +168,100 @@ def test_all_question_combo_pairs():
         intent="condition", slots={"fin_condition_term": "디딤돌대출"})])
     pairs = db.all_question_combo_pairs()
     assert pairs == [("condition", {"fin_condition_term": "디딤돌대출"})]
+
+
+# ---------------------------------------------------------------
+# 시드 출처 → 질문 배경 연결 (② 탭 '이 질문의 배경')
+# ---------------------------------------------------------------
+
+def trend_question(qid: str, slots: dict, trend_slots: list[str], **over) -> dict:
+    return question(qid, "테스트 질문입니다", "2026-08-19T09:00:00",
+                    slots=slots, trend_slots=trend_slots, seed_origin="trend", **over)
+
+
+def test_question_sources_links_question_to_article():
+    db.add_trend_seeds([{
+        "value": "두쫀쿠", "pool": "hot_item", "source": "편의점 디저트 1위",
+        "source_url": "https://example.com/a", "source_date": "2026-08-18",
+        "evidence": "두쫀쿠가 매출 1위에 올랐다.", "expires_at": None}])
+    db.insert_questions([trend_question("q1", {"hot_item": "두쫀쿠"}, ["hot_item"])])
+
+    srcs = db.question_sources("q1")
+    assert len(srcs) == 1
+    assert srcs[0]["source_url"] == "https://example.com/a"
+    assert srcs[0]["source_date"] == "2026-08-18"
+    assert "매출 1위" in srcs[0]["evidence"]
+
+
+def test_question_sources_only_returns_trend_sourced_slots():
+    """기본 시드에서 온 슬롯은 출처가 없다 — 없는 근거를 지어내지 않는지."""
+    db.add_trend_seeds([{"value": "두쫀쿠", "pool": "hot_item", "source": "기사",
+                         "expires_at": None}])
+    db.insert_questions([trend_question(
+        "q1", {"hot_item": "두쫀쿠", "anchor": "가평역"}, ["hot_item"])])
+    srcs = db.question_sources("q1")
+    assert [s["value"] for s in srcs] == ["두쫀쿠"]
+
+
+def test_question_sources_empty_for_base_and_deleted_seed():
+    db.insert_questions([question("base1", "기본 시드 질문", "2026-08-19T09:00:00")])
+    assert db.question_sources("base1") == []
+    assert db.question_sources("없는id") == []
+
+    db.add_trend_seeds([{"value": "바비", "pool": "typhoon_name", "source": "기사",
+                         "expires_at": None}])
+    db.insert_questions([trend_question("q2", {"typhoon_name": "바비"}, ["typhoon_name"])])
+    assert len(db.question_sources("q2")) == 1
+    sid = int(db.trend_seeds_df().iloc[0]["id"])
+    db.delete_trend_seeds([sid])
+    # 시드를 지우면 배경은 사라지되 질문·검수 기록은 멀쩡해야 한다
+    assert db.question_sources("q2") == []
+    assert db.next_pending() is not None
+
+
+def test_results_df_carries_seed_evidence():
+    db.add_trend_seeds([{
+        "value": "두쫀쿠", "pool": "hot_item", "source": "편의점 디저트 1위",
+        "source_url": "https://example.com/a", "source_date": "2026-08-18",
+        "expires_at": None}])
+    db.insert_questions([
+        trend_question("q1", {"hot_item": "두쫀쿠"}, ["hot_item"]),
+        question("q2", "기본 시드 질문", "2026-08-19T09:00:00"),
+    ])
+    for qid in ("q1", "q2"):
+        db.save_review(qid, "응답", "fail", "최신성", "", "pass", "", "",
+                       f"sid-{qid}", "tester", "cbt")
+
+    res = db.results_df().set_index("질문ID")
+    assert "https://example.com/a" in res.loc["q1", "시드근거"]
+    assert "2026-08-18" in res.loc["q1", "시드근거"]
+    assert res.loc["q2", "시드근거"] == ""
+
+
+def test_migration_keeps_old_rows_and_adds_columns():
+    """출처 기능 이전 스키마의 DB를 열어도 데이터가 살아 있고 컬럼만 붙는지."""
+    with db.get_conn() as conn:
+        for col in ("trend_slots",):
+            conn.execute(f"ALTER TABLE questions DROP COLUMN {col}")
+        for col in ("source_url", "source_date", "evidence"):
+            conn.execute(f"ALTER TABLE trend_seeds DROP COLUMN {col}")
+        conn.execute(
+            "INSERT INTO questions (id, domain, domain_name, intent, intent_name,"
+            " slots_json, style_json, question, gen_mode, created_at, seed_origin)"
+            " VALUES ('old1','weather','날씨','t','t','{}','{}','구버전 질문',"
+            "'template','2026-07-01T00:00:00','trend')")
+        conn.execute(
+            "INSERT INTO trend_seeds (value, pool, source, added_at)"
+            " VALUES ('옛시드','hot_item','옛 메모','2026-07-01T00:00:00')")
+
+    db.init_db()   # 마이그레이션
+
+    with db.get_conn() as conn:
+        qcols = {r[1] for r in conn.execute("PRAGMA table_info(questions)")}
+        scols = {r[1] for r in conn.execute("PRAGMA table_info(trend_seeds)")}
+    assert "trend_slots" in qcols
+    assert {"source_url", "source_date", "evidence"} <= scols
+
+    assert db.trend_seeds_df().iloc[0]["출처"] == "옛 메모"
+    # 구버전 질문은 배경이 없을 뿐 조회는 정상 (② 탭이 안내 문구로 처리)
+    assert db.question_sources("old1") == []

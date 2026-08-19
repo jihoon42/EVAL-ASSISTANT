@@ -128,7 +128,8 @@ st.session_state["nav_last"] = page
 _PRESERVE_KEYS = ("rv_response", "rv_search", "rv_acc", "rv_fail", "rv_acc_comment",
                   "rv_out", "rv_err", "rv_out_comment", "rv_allow_dup", "browse_pick",
                   "review_newest", "mq_text", "mq_entities", "submit_layout",
-                  "trend_src", "trend_raw", "trend_val")
+                  "trend_src", "trend_src_url", "trend_src_date", "trend_evidence",
+                  "trend_raw", "trend_val")
 for _k in _PRESERVE_KEYS:
     if _k in st.session_state:
         st.session_state[_k] = st.session_state[_k]
@@ -557,6 +558,33 @@ if page == "② 검수 진행":
                 + " · ".join(f"{k}={v}" for k, v in slots.items())
             )
 
+            # 트렌드 시드로 만든 질문이면, 그 시드가 어디서 왔는지 보여준다.
+            # 검수자가 모르는 최신 용어(예: 두쫀쿠)를 따로 검색하는 시간을 없애는 게 목적.
+            sources = db.question_sources(current["id"])
+            if sources:
+                with st.expander("📰 이 질문의 배경 — 시드 출처", expanded=False):
+                    st.caption(
+                        "이 질문에 쓰인 값이 어느 기사·리뷰에서 왔는지입니다. "
+                        "**정답지가 아니라 배경 참고입니다** — 시드는 원문에서 단어만 "
+                        "뽑은 것이고 질문 문형은 taxonomy에서 나옵니다. 앱 응답의 정오 "
+                        "판정은 평소대로 직접 확인하세요.")
+                    for s in sources:
+                        head = f"**{s['value']}** `{s['pool']}`"
+                        if s["source_date"]:
+                            head += f" · {s['source_date']} 기사"
+                        st.markdown(head)
+                        if s["source"]:
+                            st.markdown(f"- 출처: {s['source']}")
+                        if s["source_url"]:
+                            st.markdown(f"- 원문: {s['source_url']}")
+                        if s["evidence"]:
+                            st.markdown(f"> {s['evidence']}")
+                        if not (s["source"] or s["source_url"] or s["evidence"]):
+                            st.caption("등록 시 출처를 남기지 않은 시드입니다.")
+            elif current["seed_origin"] == "trend":
+                st.caption("📰 트렌드 시드 질문이지만 출처 기록이 없습니다 "
+                           "(시드가 삭제됐거나, 출처 기능 이전에 만들어진 질문).")
+
             with st.expander("✏️ 질문 다듬기 — 조금만 고치면 쓸 수 있을 때"):
                 st.caption(
                     "비문·어색한 어미만 고치면 되는 질문은 버리지 말고 여기서 고치세요. "
@@ -784,7 +812,7 @@ if page == "③ 결과·내보내기":
         st.caption("열 머리글 메뉴로 화면에서 열을 숨길 수도 있습니다. "
                    "숨김은 화면에만 적용되고 xlsx에는 위 컬럼 구성이 그대로 나갑니다.")
 
-        with st.expander("내부분석 전체 보기 (앱 응답·도메인·인텐트 포함)"):
+        with st.expander("내부분석 전체 보기 (앱 응답·도메인·인텐트·시드근거 포함)"):
             st.dataframe(results, width="stretch", hide_index=True)
 
         with st.expander("✏️ 검수 기록 수정·삭제 — 잘못 붙여넣은 응답·search ID, 코멘트 오타 교정"):
@@ -891,7 +919,9 @@ if page == "③ 결과·내보내기":
             type="primary",
         )
         st.caption("※ 도메인별 시트(제출_날씨 / 제출_로컬 / …)를 각 제출 시트에 그대로 복사하세요. "
-                   "'내부분석' 시트에는 앱 응답 전문·도메인·인텐트가 포함되니 제출본에서는 빼세요.")
+                   "'내부분석' 시트에는 앱 응답 전문·도메인·인텐트와 '시드근거'(트렌드 시드의 "
+                   "출처 기사)가 포함되니 제출본에서는 빼세요. 최신성 fail 건을 나중에 되짚을 때 "
+                   "이 컬럼이 근거가 됩니다.")
 
 # ---------------------------------------------------------------
 # ④ 트렌드 시드 (최신 기사·리뷰 → 엔티티 추출 → 생성에 혼입)
@@ -904,10 +934,42 @@ if page == "④ 트렌드 시드":
         "③ 탭에서 최신성 fail율을 따로 볼 수 있습니다. **본문 원문은 저장하지 않고**, "
         "만료된 시드는 생성에 쓰이지 않습니다."
     )
+    st.caption(
+        "아래 출처 3칸은 이 화면에서 등록하는 모든 시드에 함께 붙습니다. "
+        "**검수자가 ② 탭에서 '이 질문의 배경'으로 보게 되는 내용**이니, 모르는 용어를 "
+        "만났을 때 바로 이해할 수 있을 만큼만 채워 주세요. 비워 두어도 등록은 됩니다."
+    )
 
-    trend_src = st.text_input("출처 메모 (기사 제목·URL 등)", key="trend_src")
+    sc1, sc2 = st.columns([3, 1])
+    with sc1:
+        trend_src = st.text_input("출처 제목", key="trend_src",
+                                  placeholder="예: 편의점 디저트 매출 1위 오른 '두쫀쿠'")
+    with sc2:
+        trend_src_date = st.text_input("기사 일자", key="trend_src_date",
+                                       placeholder="2026-08-19",
+                                       help="YYYY-MM-DD. 최신성 fail을 나중에 되짚을 때 기준이 됩니다.")
+    trend_src_url = st.text_input("출처 URL", key="trend_src_url",
+                                  placeholder="https://...")
+    trend_evidence = st.text_area(
+        "발췌 (선택) — 시드가 나온 대목 한두 문장", height=68, key="trend_evidence",
+        placeholder="검수자가 이 한 문장만 읽고도 무슨 얘긴지 알 수 있게.")
     trend_raw = st.text_area("기사/리뷰 본문 붙여넣기", height=180, key="trend_raw",
                              placeholder="본문을 통째로 붙여넣어도 됩니다. 광고 문구는 추출·검토 단계에서 걸러집니다.")
+
+    _src_date = trend_src_date.strip()
+    if _src_date:
+        try:
+            date.fromisoformat(_src_date)
+        except ValueError:
+            st.warning(f"기사 일자 '{_src_date}'는 YYYY-MM-DD 형식이 아닙니다. "
+                       "그대로 저장되지만 나중에 날짜로 정렬·비교할 수 없습니다.")
+
+    def _seed_item(value: str, pool: str, expires: str) -> dict:
+        """화면 위쪽 출처 3칸을 시드 레코드에 붙인다 (추출 등록·직접 등록 공용)."""
+        return {"value": value, "pool": pool, "expires_at": expires,
+                "source": trend_src.strip(), "source_url": trend_src_url.strip(),
+                "source_date": _src_date, "evidence": trend_evidence.strip()}
+
     ext_thread = st.session_state.get("ext_thread")
     ext_job = st.session_state.get("ext_job")
     ext_running = ext_thread is not None and ext_thread.is_alive()
@@ -981,8 +1043,7 @@ if page == "④ 트렌드 시드":
             })
         if st.button("체크한 후보 등록"):
             expires = (date.today() + timedelta(days=int(trend_days))).isoformat()
-            items = [{"value": str(r["값"]).strip(), "pool": r["풀"],
-                      "source": trend_src.strip(), "expires_at": expires}
+            items = [_seed_item(str(r["값"]).strip(), r["풀"], expires)
                      for _, r in edited.iterrows()
                      if r["등록"] and str(r["값"]).strip() and r["풀"] in TREND_POOL_GUIDE]
             n = db.add_trend_seeds(items)
@@ -1003,8 +1064,7 @@ if page == "④ 트렌드 시드":
         st.write("")
         if st.button("등록", disabled=not t_val.strip()):
             expires = (date.today() + timedelta(days=int(trend_days))).isoformat()
-            n = db.add_trend_seeds([{"value": t_val.strip(), "pool": t_pool,
-                                     "source": trend_src.strip(), "expires_at": expires}])
+            n = db.add_trend_seeds([_seed_item(t_val.strip(), t_pool, expires)])
             st.toast("등록했습니다." if n else "이미 등록된 값입니다.")
             st.rerun()
 

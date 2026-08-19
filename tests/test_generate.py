@@ -243,3 +243,40 @@ def test_extract_trend_candidates_live():
     assert isinstance(cands, list)
     for c in cands:
         assert c["pool"] in guide and 0 < len(c["value"]) <= 30
+
+
+# ---------------------------------------------------------------
+# 트렌드 슬롯 기록 (출처 되짚기의 유일한 단서)
+# ---------------------------------------------------------------
+
+def test_trend_slots_records_which_slot_came_from_trend():
+    pools, tax = gen.load_seeds(), gen.load_taxonomy()
+    rng = random.Random(3)
+    for _ in range(50):
+        c = gen.sample_combo("weather", tax, pools, rng,
+                             {"region": ["울릉도"]}, trend_ratio=1.0)
+        assert c["trend_slots"] == ["region"]
+        assert c["slots"]["region"] == "울릉도"
+        assert c["seed_origin"] == "trend"
+
+    for _ in range(50):
+        c = gen.sample_combo("weather", tax, pools, rng,
+                             {"region": ["울릉도"]}, trend_ratio=0.0)
+        assert c["trend_slots"] == [] and c["seed_origin"] == "base"
+
+
+def test_trend_slots_survive_to_db_and_resolve_to_source():
+    """생성 → 저장 → ② 탭 배경 조회까지 한 번에. 이 사슬이 끊기면 출처가 안 보인다."""
+    db.add_trend_seeds([{
+        "value": "울릉도", "pool": "region", "source": "폭염 기사",
+        "source_url": "https://example.com/heat", "source_date": "2026-08-18",
+        "expires_at": None}])
+    recs = gen.generate(count=3, domains=["weather"], mode="template", seed=11,
+                        trend_pools={"region": ["울릉도"]}, trend_ratio=1.0)
+    assert all(r["trend_slots"] == ["region"] for r in recs)
+    assert db.insert_questions(recs) == 3
+
+    for r in recs:
+        srcs = db.question_sources(r["id"])
+        assert len(srcs) == 1
+        assert srcs[0]["source_url"] == "https://example.com/heat"

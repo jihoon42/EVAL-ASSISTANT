@@ -96,6 +96,8 @@ def sample_combo(domain_key: str, taxonomy: dict, pools: dict, rng: random.Rando
                  trend_ratio: float = 0.0) -> dict:
     """슬롯 조합 샘플링. trend_pools에 해당 슬롯 값이 있으면 trend_ratio 확률로
     트렌드 시드에서 뽑고, 하나라도 쓰이면 seed_origin='trend'로 태깅한다.
+    어느 슬롯이 트렌드에서 왔는지는 trend_slots에 남는다 — 검수 화면에서 그 시드의
+    출처 기사를 되짚기 위한 유일한 단서이므로 값과 함께 반드시 보존한다.
 
     기본 풀이 빈 슬롯(seeds.yaml의 트렌드 전용 풀, 예: typhoon_name)은 트렌드 시드가
     있을 때만 그 인텐트가 후보에 들어가고, 값은 비율과 무관하게 트렌드에서 뽑는다.
@@ -117,7 +119,7 @@ def sample_combo(domain_key: str, taxonomy: dict, pools: dict, rng: random.Rando
     intent = rng.choice(available)
 
     slots: dict[str, str] = {}
-    trend_used = False
+    trend_slots: list[str] = []   # 트렌드 시드에서 값을 받은 슬롯 (출처 되짚기용)
     for slot in intent["slots"]:
         trend_vals = tp.get(slot) or []
         base_vals = pools[slot]
@@ -131,7 +133,7 @@ def sample_combo(domain_key: str, taxonomy: dict, pools: dict, rng: random.Rando
             candidates = [v for v in pool_vals if v != slots[base]]
             value = rng.choice(candidates) if candidates else value
         if pick_trend:
-            trend_used = True
+            trend_slots.append(slot)
         slots[slot] = value
 
     styles = taxonomy.get("styles", {})
@@ -145,7 +147,8 @@ def sample_combo(domain_key: str, taxonomy: dict, pools: dict, rng: random.Rando
         "slots": slots,
         "style": style,
         "templates": intent.get("templates", []),
-        "seed_origin": "trend" if trend_used else "base",
+        "seed_origin": "trend" if trend_slots else "base",
+        "trend_slots": trend_slots,
     }
 
 
@@ -558,6 +561,7 @@ def generate(
                 "model": model if gen_mode == "ollama" else None,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "seed_origin": combo.get("seed_origin", "base"),
+                "trend_slots": combo.get("trend_slots", []),
             })
             seen_exact.add(_normalize(question))
             accepted_trigrams.append(_trigrams(question))
